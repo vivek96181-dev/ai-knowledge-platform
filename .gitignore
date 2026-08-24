@@ -1,0 +1,40 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Java / Maven
+target/
+*.class
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build files
+dist/
+build/
+
+# Keys and certificates
+*.pem
+*.key
+
+# Local data
+data/
