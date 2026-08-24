@@ -3,16 +3,22 @@ spring:
     name: ai-knowledge-platform-test
 
   datasource:
-    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;NON_KEYWORDS=USER
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
 
   jpa:
+    # H2 dialect so Hibernate generates H2-compatible DDL (not PostgreSQL-specific SQL)
+    database-platform: org.hibernate.dialect.H2Dialect
     hibernate:
       ddl-auto: create-drop
     show-sql: true
     open-in-view: false
+    properties:
+      hibernate:
+        # Prevents conflicts with H2 reserved keywords (e.g. "user" is reserved in H2)
+        globally_quoted_identifiers: true
 
 server:
   port: 0
