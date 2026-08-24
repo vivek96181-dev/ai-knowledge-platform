@@ -32,3 +32,9 @@ spring:
 # Custom CORS configuration (allows frontend access)
 cors:
   allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
+
+# JWT configuration — ALWAYS override JWT_SECRET with a strong random value in production!
+# The default is only safe for local development. Never commit a real secret here.
+jwt:
+  secret: ${JWT_SECRET:insecure-local-dev-only-secret-key-minimum-32-chars!!}
+  expiration-ms: ${JWT_EXPIRATION_MS:3600000}  # 1 hour default

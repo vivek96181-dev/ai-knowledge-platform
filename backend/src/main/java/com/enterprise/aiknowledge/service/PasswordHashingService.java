@@ -46,4 +46,19 @@ public class PasswordHashingService {
     public String hash(String plaintext) {
         return encoder.encode(plaintext);
     }
+
+    /**
+     * Verifies a plaintext password against a stored BCrypt hash.
+     *
+     * <p>BCrypt's {@code matches()} re-derives the hash from the plaintext using the
+     * salt that is embedded in the hash string, then compares the result.
+     * It does NOT re-hash to a new value — it only verifies.</p>
+     *
+     * @param plaintext the raw password from the login request
+     * @param hash      the BCrypt hash stored in the database
+     * @return {@code true} if the plaintext matches the hash
+     */
+    public boolean matches(String plaintext, String hash) {
+        return encoder.matches(plaintext, hash);
+    }
 }

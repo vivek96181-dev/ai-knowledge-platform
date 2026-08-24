@@ -100,6 +100,22 @@ public class UserService {
     }
 
     /**
+     * Returns a single user by their email address.
+     *
+     * <p>Used by {@code AuthController.getCurrentUser()} to fetch the full user
+     * record from the email stored as the JWT principal.</p>
+     *
+     * @param email the user's email address
+     * @return the user as a {@link UserResponse}
+     * @throws ResourceNotFoundException if no user with this email exists
+     */
+    public UserResponse getUserByEmail(String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + email));
+        return mapToResponse(user);
+    }
+
+    /**
      * Deletes a user by their database ID.
      *
      * <p>We verify existence first so we can throw a meaningful 404 rather

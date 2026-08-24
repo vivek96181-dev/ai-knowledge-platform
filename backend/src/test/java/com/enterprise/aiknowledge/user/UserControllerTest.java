@@ -17,6 +17,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -174,8 +175,10 @@ class UserControllerTest {
         UserResponse created = objectMapper.readValue(
                 createResult.getResponse().getContentAsString(), UserResponse.class);
 
-        // Now fetch by that ID
-        mockMvc.perform(get(BASE_URL + "/" + created.id()))
+        // GET /api/users/{id} requires authentication (any role).
+        // user(...).roles("USER") injects a mock authentication — bypasses JWT filter.
+        mockMvc.perform(get(BASE_URL + "/" + created.id())
+                        .with(user("test@test.com").roles("USER")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(created.id()))
                 .andExpect(jsonPath("$.email").value("vivek@example.com"))
@@ -190,7 +193,9 @@ class UserControllerTest {
     @Test
     @DisplayName("GET /api/users/{id} → 404 NOT FOUND for non-existent ID")
     void shouldReturn404ForNonExistentUser() throws Exception {
-        mockMvc.perform(get(BASE_URL + "/99999"))
+        // Without authentication this would return 401, not 404 — must supply a mock user
+        mockMvc.perform(get(BASE_URL + "/99999")
+                        .with(user("test@test.com").roles("USER")))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404))
                 .andExpect(jsonPath("$.message").value("User not found with id: 99999"));
@@ -220,8 +225,9 @@ class UserControllerTest {
                                 """))
                 .andExpect(status().isCreated());
 
-        // Fetch all and verify count and content
-        mockMvc.perform(get(BASE_URL))
+        // GET /api/users is ADMIN-only — supply a mock ADMIN user
+        mockMvc.perform(get(BASE_URL)
+                        .with(user("admin@test.com").roles("ADMIN")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[0].email").value("vivek@example.com"))
@@ -245,12 +251,14 @@ class UserControllerTest {
         UserResponse created = objectMapper.readValue(
                 createResult.getResponse().getContentAsString(), UserResponse.class);
 
-        // Delete the user
-        mockMvc.perform(delete(BASE_URL + "/" + created.id()))
+        // DELETE requires ADMIN role
+        mockMvc.perform(delete(BASE_URL + "/" + created.id())
+                        .with(user("admin@test.com").roles("ADMIN")))
                 .andExpect(status().isOk());
 
-        // Verify the user is truly gone (404 on subsequent GET)
-        mockMvc.perform(get(BASE_URL + "/" + created.id()))
+        // Verify the user is truly gone (404 on subsequent GET) — need auth for GET too
+        mockMvc.perform(get(BASE_URL + "/" + created.id())
+                        .with(user("admin@test.com").roles("ADMIN")))
                 .andExpect(status().isNotFound());
 
         // Verify repository is empty

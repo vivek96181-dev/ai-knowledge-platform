@@ -22,3 +22,8 @@ spring:
 
 server:
   port: 0
+
+# Fixed JWT config for tests — safe to commit, only used with H2 in-memory test DB
+jwt:
+  secret: test-jwt-secret-key-that-is-long-enough-for-hmac-sha256-algorithm-ok
+  expiration-ms: 3600000

@@ -61,17 +61,48 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Spring Security Crypto: Provides BCryptPasswordEncoder WITHOUT full Spring Security.
-             We only need BCrypt for password hashing — no auth filters, no JWT, no login yet. -->
+        <!-- Spring Security: Replaces the previous spring-security-crypto-only dependency.
+             The full starter includes: authentication filters, authorization, BCrypt encoder,
+             SecurityFilterChain, and everything needed for JWT-based security. -->
         <dependency>
-            <groupId>org.springframework.security</groupId>
-            <artifactId>spring-security-crypto</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- JJWT API: Compile-time interfaces used in JwtService (Jwts.builder, Claims, etc.) -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+            <version>0.12.6</version>
+        </dependency>
+
+        <!-- JJWT Implementation: Runtime engine that actually signs and parses tokens. -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- JJWT Jackson: Serializes/deserializes JWT claims to/from JSON at runtime. -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
         </dependency>
 
         <!-- Spring Boot Starter Test: JUnit 5, Mockito, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Spring Security Test: SecurityMockMvcRequestPostProcessors.user(), @WithMockUser -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
