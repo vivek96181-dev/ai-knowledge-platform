@@ -61,6 +61,13 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Spring Security Crypto: Provides BCryptPasswordEncoder WITHOUT full Spring Security.
+             We only need BCrypt for password hashing — no auth filters, no JWT, no login yet. -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+
         <!-- Spring Boot Starter Test: JUnit 5, Mockito, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
