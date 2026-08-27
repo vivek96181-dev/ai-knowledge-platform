@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -30,30 +31,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Integration tests for JWT Authentication.
- *
- * <p>Covers all 15 test scenarios:
- * <ol>
- *   <li>Login succeeds with correct credentials</li>
- *   <li>Login fails with wrong password</li>
- *   <li>Login fails for unknown email</li>
- *   <li>JWT token is non-null and non-blank on successful login</li>
- *   <li>Valid JWT token grants access to a protected endpoint (full round-trip)</li>
- *   <li>Missing Authorization header returns 401</li>
- *   <li>Invalid/garbage token returns 401</li>
- *   <li>Expired token returns 401</li>
- *   <li>USER can access GET /api/users/{id}</li>
- *   <li>USER cannot access GET /api/users (ADMIN only) → 403</li>
- *   <li>USER cannot DELETE /api/users/{id} (ADMIN only) → 403</li>
- *   <li>ADMIN can access GET /api/users → 200</li>
- *   <li>ADMIN can DELETE a user → 200</li>
- *   <li>GET /api/health is public — no token needed → 200</li>
- *   <li>POST /api/auth/login is public — no token needed</li>
- * </ol>
- * </p>
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@EmbeddedKafka(partitions = 1, topics = {"document-uploaded"})
 class AuthControllerTest {
 
     @Autowired private MockMvc mockMvc;

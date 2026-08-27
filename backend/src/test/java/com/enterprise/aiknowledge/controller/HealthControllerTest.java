@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -16,19 +17,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Integration test for {@link HealthController}.
- *
- * <p>Uses {@code @SpringBootTest} + {@code @AutoConfigureMockMvc} (rather than the
- * lighter {@code @WebMvcTest}) because Java 25's class format is not yet supported
- * by the version of Byte Buddy bundled with this Spring Boot release. This means
- * {@code @MockBean} fails on Java 25. By loading the real application context with
- * the H2 test profile, we avoid mocking entirely.</p>
- *
- * <p>The health endpoint is configured as {@code permitAll()} in {@code SecurityConfig},
- * so no authentication token is needed in this test.</p>
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@EmbeddedKafka(partitions = 1, topics = {"document-uploaded"})
 class HealthControllerTest {
 
     @Autowired
