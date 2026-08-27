@@ -58,6 +58,7 @@ class AuthControllerTest {
 
     @Autowired private MockMvc mockMvc;
     @Autowired private UserRepository userRepository;
+    @Autowired private com.enterprise.aiknowledge.repository.DocumentRepository documentRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private ObjectMapper objectMapper;
 
@@ -83,6 +84,7 @@ class AuthControllerTest {
      */
     @BeforeEach
     void setUp() {
+        documentRepository.deleteAll();
         userRepository.deleteAll();
 
         // Create a regular USER account

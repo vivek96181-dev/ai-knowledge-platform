@@ -31,13 +31,22 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
 - Stateless authentication filter (`JwtAuthenticationFilter`) reading token claims directly (zero DB lookups per auth check)
 - `POST /api/auth/login` endpoint returning signed JWT access token (`LoginResponse`)
 - `GET /api/auth/me` endpoint returning current user profile
-- Role-based authorization rules:
-  - `GET /api/health`, `POST /api/auth/login`, `POST /api/users` are **public**
-  - `GET /api/users` (list all) and `DELETE /api/users/{id}` require **`ADMIN`** role
-  - `GET /api/users/{id}` and `GET /api/auth/me` require **authenticated user (`USER` or `ADMIN`)**
-- Custom JSON 401 Unauthorized (`SecurityAuthenticationEntryPoint`) and 403 Forbidden (`SecurityAccessDeniedHandler`) responses
+- Role-based authorization rules
+- Custom JSON 401 Unauthorized and 403 Forbidden responses
 - Generic authentication error handling (prevents user enumeration attacks)
-- Comprehensive automated test suite (29 tests passing)
+
+### Phase 4 — Document Management
+- `Document` JPA entity & `DocumentStatus` enum (`UPLOADED`, `PROCESSING`, `COMPLETED`, `FAILED`)
+- PDF file upload (`POST /api/documents` via `multipart/form-data`)
+- File validation rules: non-empty file, PDF MIME type (`application/pdf`), `.pdf` file extension, file size limits (10MB)
+- Safe unique stored filename generation (`UUID + "_" + originalFilename`) preventing path traversal and collisions
+- `FileStorageService` abstraction implemented by `LocalFileStorageService` storing files on configurable local directory
+- Server-side user ownership enforcement:
+  - `USER` role can only view and delete documents they own (`owner_id == user.id`)
+  - `ADMIN` role can view and delete documents across all users
+  - Attempting to access or delete another user's document returns `403 Forbidden`
+- Physical file deletion on document deletion
+- Comprehensive automated test suite (42 total tests passing)
 
 ---
 
@@ -86,6 +95,7 @@ Safe defaults are provided for local development — **never commit real credent
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed frontend origins | `http://localhost:3000,http://localhost:5173` |
 | `JWT_SECRET` | HMAC-SHA256 signing key (≥ 32 chars) | `insecure-local-dev-only-secret-key...` |
 | `JWT_EXPIRATION_MS` | JWT token validity duration in milliseconds | `3600000` (1 hour) |
+| `FILE_UPLOAD_DIR` | Directory on disk for physical document storage | `uploads` |
 
 ### Setting Environment Variables
 
@@ -95,6 +105,7 @@ $env:DB_URL="jdbc:postgresql://localhost:5432/ai_knowledge_db"
 $env:DB_USERNAME="postgres"
 $env:DB_PASSWORD="your_secure_password"
 $env:JWT_SECRET="your_strong_random_secret_key_minimum_32_chars"
+$env:FILE_UPLOAD_DIR="uploads"
 ```
 
 **Linux / macOS:**
@@ -103,6 +114,7 @@ export DB_URL="jdbc:postgresql://localhost:5432/ai_knowledge_db"
 export DB_USERNAME="postgres"
 export DB_PASSWORD="your_secure_password"
 export JWT_SECRET="your_strong_random_secret_key_minimum_32_chars"
+export FILE_UPLOAD_DIR="uploads"
 ```
 
 ---
@@ -151,142 +163,156 @@ The application starts on `http://localhost:8080`.
 | `/api/users/{id}` | `GET` | `USER` or `ADMIN` | Get user by ID | `200 OK` |
 | `/api/users` | `GET` | `ADMIN` only | Get all registered users | `200 OK` |
 | `/api/users/{id}` | `DELETE` | `ADMIN` only | Delete user by ID | `200 OK` |
+| `/api/documents` | `POST` | `USER` or `ADMIN` | Upload a PDF document (`multipart/form-data`) | `201 Created` |
+| `/api/documents` | `GET` | `USER` or `ADMIN` | List documents (`USER` sees own; `ADMIN` sees all) | `200 OK` |
+| `/api/documents/{id}` | `GET` | `USER` or `ADMIN` | Get document metadata (Owner or Admin) | `200 OK` |
+| `/api/documents/{id}` | `DELETE` | `USER` or `ADMIN` | Delete document & file (Owner or Admin) | `200 OK` |
 
 ### HTTP Status Codes
 
 | Code | Meaning | Scenario |
 | :--- | :--- | :--- |
 | `200 OK` | Success | Read, delete, or successful login |
-| `201 Created` | Created | User registered successfully |
-| `400 Bad Request` | Validation Error | Blank fields, malformed email, short password |
+| `201 Created` | Created | User registered or document uploaded successfully |
+| `400 Bad Request` | Validation Error | Missing/empty file, non-PDF file type, or invalid filename |
 | `401 Unauthorized` | Auth Required / Bad Credentials | Missing/expired/invalid JWT, or invalid login credentials |
-| `403 Forbidden` | Access Denied | Authenticated user lacks required role (e.g. `USER` calling `GET /api/users`) |
-| `404 Not Found` | Resource Not Found | User with given ID does not exist |
+| `403 Forbidden` | Access Denied | Authenticated user lacks required role or tries to access another user's document |
+| `404 Not Found` | Resource Not Found | User or document with given ID does not exist |
 | `409 Conflict` | Duplicate Resource | Email already registered |
+| `413 Payload Too Large` | Limit Exceeded | File size exceeds maximum configured limit (10MB) |
 
 ---
 
 ## 6. Example Requests & Usage Flow
 
-### 1. Register a User Account (Public)
+### 1. Register & Login
 ```bash
+# Register
 curl -X POST http://localhost:8080/api/users \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "Vivek",
-    "email": "vivek@example.com",
-    "password": "MySecurePassword123"
-  }'
-```
+  -d '{"name":"Vivek","email":"vivek@example.com","password":"MySecurePassword123"}'
 
-### 2. Login to get JWT Token (Public)
-```bash
+# Login
 curl -X POST http://localhost:8080/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{
-    "email": "vivek@example.com",
-    "password": "MySecurePassword123"
-  }'
+  -d '{"email":"vivek@example.com","password":"MySecurePassword123"}'
 ```
 
-**Response (200 OK):**
+### 2. Upload a PDF Document
+```bash
+curl -X POST http://localhost:8080/api/documents \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -F "file=@/path/to/sample.pdf"
+```
+
+**Response (201 Created):**
 ```json
 {
-  "accessToken": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ2aXZla0BleGFtcGxlLmNvbSIsInJvbGUiOiJVU0VSIiwiaWF0IjoxNzI0NTQwMDAwLCJleHAiOjE3MjQ1NDM2MDB9.signature",
-  "tokenType": "Bearer",
-  "expiresIn": 3600
+  "id": 1,
+  "originalFilename": "sample.pdf",
+  "contentType": "application/pdf",
+  "fileSize": 1048576,
+  "status": "UPLOADED",
+  "createdAt": "2026-08-27T14:30:00",
+  "updatedAt": "2026-08-27T14:30:00",
+  "ownerId": 1,
+  "ownerEmail": "vivek@example.com"
 }
 ```
 
-### 3. Access Protected Profile Endpoint using Bearer Token
+### 3. List Own Documents
 ```bash
-curl http://localhost:8080/api/auth/me \
-  -H "Authorization: Bearer <YOUR_ACCESS_TOKEN>"
+curl http://localhost:8080/api/documents \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
 ```
 
-### 4. Admin Access Example (List All Users)
+### 4. Delete Own Document
 ```bash
-curl http://localhost:8080/api/users \
-  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>"
+curl -X DELETE http://localhost:8080/api/documents/1 \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
 ```
 
 ---
 
-## 7. Architecture & Authentication Flow
+## 7. Architecture & Package Structure
 
-### JWT Authentication Request Flow
+### Request Flow for Document Management
 
 ```
-HTTP Request with "Authorization: Bearer <jwt>"
+HTTP Request (multipart/form-data + Bearer JWT)
     ↓
-SecurityConfig (FilterChain)
+JwtAuthenticationFilter (Validates JWT, sets principal in SecurityContext)
     ↓
-JwtAuthenticationFilter (OncePerRequestFilter)
-    ├─ Extract Bearer token header
-    ├─ Verify HMAC-SHA256 signature & expiration via JwtService
-    ├─ Read 'sub' (email) & 'role' claims directly from token
-    └─ Set SecurityContextHolder.getContext().setAuthentication(auth)  [No DB query!]
+SecurityConfig (Checks authentication matchers for /api/documents/**)
     ↓
-Spring Security Authorization Manager
-    ├─ Match path against permitAll() / hasRole() rules
-    ├─ 401 Unauthorized (if unauthenticated & endpoint protected)
-    └─ 403 Forbidden (if authenticated but role insufficient)
+DocumentController (Parses request, passes user email & role to DocumentService)
     ↓
-RestController (AuthController / UserController)
+DocumentService (Validates PDF format, enforces ownership server-side)
+    ├── LocalFileStorageService (Writes physical file to disk under uploads/)
+    └── DocumentRepository (Persists metadata row to PostgreSQL)
 ```
 
 ### Package Structure
 
 ```
 com.enterprise.aiknowledge
-├── AiKnowledgePlatformApplication.java   ← @SpringBootApplication entry point
+├── AiKnowledgePlatformApplication.java
 │
 ├── config
-│   ├── SecurityConfig.java              ← Spring Security FilterChain & Beans
-│   └── WebMvcConfig.java                ← CORS configuration
+│   ├── SecurityConfig.java              ← Security matchers & filter chain
+│   └── WebMvcConfig.java
 │
 ├── controller
-│   ├── AuthController.java              ← POST /api/auth/login, GET /api/auth/me
-│   ├── HealthController.java            ← GET /api/health
-│   └── UserController.java              ← CRUD /api/users
+│   ├── AuthController.java
+│   ├── DocumentController.java          ← POST, GET, DELETE /api/documents
+│   ├── HealthController.java
+│   └── UserController.java
 │
 ├── dto
-│   ├── CreateUserRequest.java          ← User registration payload
-│   ├── HealthResponse.java             ← Health check response record
-│   ├── LoginRequest.java               ← Login payload
-│   ├── LoginResponse.java              ← JWT token response payload
-│   └── UserResponse.java               ← User profile record (no passwordHash)
+│   ├── CreateUserRequest.java
+│   ├── DocumentResponse.java            ← Document metadata DTO (no disk paths)
+│   ├── HealthResponse.java
+│   ├── LoginRequest.java
+│   ├── LoginResponse.java
+│   └── UserResponse.java
 │
 ├── exception
-│   ├── EmailAlreadyExistsException.java ← Duplicate email error → 409
-│   ├── ErrorResponse.java              ← Standardized JSON error response
-│   ├── GlobalExceptionHandler.java     ← Translates exceptions to HTTP responses
-│   └── ResourceNotFoundException.java  ← Not found error → 404
+│   ├── EmailAlreadyExistsException.java
+│   ├── ErrorResponse.java
+│   ├── GlobalExceptionHandler.java     ← Maps InvalidFileException(400), AccessDeniedException(403), MaxUploadSizeExceededException(413)
+│   ├── InvalidFileException.java       ← Bad file upload error
+│   └── ResourceNotFoundException.java
 │
 ├── model
-│   ├── Role.java                       ← Enum: USER | ADMIN
-│   └── User.java                       ← JPA Entity ("users" table)
+│   ├── Document.java                    ← JPA Entity ("documents" table)
+│   ├── DocumentStatus.java              ← Enum: UPLOADED | PROCESSING | COMPLETED | FAILED
+│   ├── Role.java
+│   └── User.java
 │
 ├── repository
-│   └── UserRepository.java             ← JpaRepository + findByEmail + existsByEmail
+│   ├── DocumentRepository.java          ← findByOwnerId, findByIdAndOwnerId
+│   └── UserRepository.java
 │
 ├── security
-│   ├── JwtAuthenticationFilter.java     ← OncePerRequestFilter for JWT validation
-│   ├── JwtService.java                  ← JJWT Token generation, parsing & claims
-│   ├── SecurityAccessDeniedHandler.java ← Custom 403 JSON handler
-│   └── SecurityAuthenticationEntryPoint.java ← Custom 401 JSON handler
+│   ├── JwtAuthenticationFilter.java
+│   ├── JwtService.java
+│   ├── SecurityAccessDeniedHandler.java
+│   └── SecurityAuthenticationEntryPoint.java
 │
 └── service
-    ├── AuthService.java                 ← Login authentication logic
-    ├── PasswordHashingService.java     ← BCrypt hashing & matching service
-    └── UserService.java                 ← User CRUD business logic
+    ├── AuthService.java
+    ├── DocumentService.java             ← Upload, List, Get, Delete business logic
+    ├── FileStorageService.java          ← File storage abstraction interface
+    ├── LocalFileStorageService.java     ← Physical local disk storage implementation
+    ├── PasswordHashingService.java
+    └── UserService.java
 ```
 
 ---
 
-## 8. Security Highlights
+## 8. Security & Storage Highlights
 
-- **Stateless & Scalable:** Zero server-side session state. All identity & role claims reside within the signed JWT.
-- **Constant-Time BCrypt Hashing:** Passwords verified via timing-safe BCrypt comparison (`BCryptPasswordEncoder`).
-- **Protection Against User Enumeration:** Authentication failures return generic `"Invalid email or password"` (401) regardless of whether email or password was wrong.
-- **Clean Exception Separation:** Controller exceptions are handled by `@RestControllerAdvice`, while Spring Security filter-level errors (401/403) are handled by custom security entry points writing standardized JSON error payloads.
+- **Server-Side Ownership Enforcement:** Client-supplied user IDs are ignored. Ownership is determined strictly from the authenticated JWT principal.
+- **Path Traversal Protection:** Generated stored filenames combine UUID with normalized filenames, preventing path traversal attacks.
+- **Physical Clean-up:** Deleting a document metadata record automatically removes the stored physical file from disk.
+- **Storage Decoupling:** `FileStorageService` interface isolates physical storage from business logic, allowing easy transition to S3 or cloud storage in future phases without altering `DocumentService`.

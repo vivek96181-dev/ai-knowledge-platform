@@ -46,6 +46,9 @@ class UserControllerTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.enterprise.aiknowledge.repository.DocumentRepository documentRepository;
+
+    @Autowired
     private ObjectMapper objectMapper;
 
     // Reusable BCrypt encoder for verifying stored hashes in tests
@@ -63,11 +66,12 @@ class UserControllerTest {
             """;
 
     /**
-     * Delete all users before every test so each test starts with a clean database.
-     * This prevents test-ordering dependencies.
+     * Delete all documents and users before every test so each test starts with a clean database.
+     * This prevents test-ordering dependencies and foreign key constraint violations.
      */
     @BeforeEach
     void clearDatabase() {
+        documentRepository.deleteAll();
         userRepository.deleteAll();
     }
 

@@ -64,8 +64,7 @@ public class AuthController {
      */
     @GetMapping("/me")
     public ResponseEntity<UserResponse> getCurrentUser(Authentication authentication) {
-        // authentication.getPrincipal() returns the email String we stored in JwtAuthenticationFilter
-        String email = (String) authentication.getPrincipal();
+        String email = authentication.getName();
         return ResponseEntity.ok(userService.getUserByEmail(email));
     }
 }
