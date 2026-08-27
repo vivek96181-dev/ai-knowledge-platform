@@ -38,3 +38,5 @@ build/
 
 # Local data
 data/
+uploads/
+uploads-test/

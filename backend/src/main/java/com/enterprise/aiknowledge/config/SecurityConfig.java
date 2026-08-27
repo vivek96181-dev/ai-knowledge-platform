@@ -85,6 +85,7 @@ public class SecurityConfig {
                 // Any authenticated user (USER or ADMIN)
                 .requestMatchers(HttpMethod.GET, "/api/users/**").authenticated()     // Get user by ID
                 .requestMatchers("/api/auth/me").authenticated()                      // Current user info
+                .requestMatchers("/api/documents/**").authenticated()                 // Document management
 
                 // Everything else also requires authentication (safe default)
                 .anyRequest().authenticated()
