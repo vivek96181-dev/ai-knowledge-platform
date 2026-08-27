@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -23,20 +24,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Integration tests for the User Management API.
- *
- * <p><strong>Strategy:</strong>
- * {@code @SpringBootTest} loads the full Spring context.
- * {@code @AutoConfigureMockMvc} sets up MockMvc to test HTTP endpoints without
- * starting a real server.
- * {@code @ActiveProfiles("test")} activates {@code application-test.yml},
- * which configures an H2 in-memory database — no PostgreSQL required to run tests.</p>
- *
- * <p>Each test method gets a clean database state via {@link #clearDatabase()},
- * which runs before every test.</p>
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@EmbeddedKafka(partitions = 1, topics = {"document-uploaded"})
 class UserControllerTest {
 
     @Autowired

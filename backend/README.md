@@ -28,7 +28,7 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
 ### Phase 3 — JWT Authentication & Role-Based Access Control
 - Full Spring Security architecture integration (`SecurityConfig`)
 - JWT Token Generation & Verification via JJWT (`JwtService`)
-- Stateless authentication filter (`JwtAuthenticationFilter`) reading token claims directly (zero DB lookups per auth check)
+- Stateless authentication filter (`JwtAuthenticationFilter`) reading token claims directly
 - `POST /api/auth/login` endpoint returning signed JWT access token (`LoginResponse`)
 - `GET /api/auth/me` endpoint returning current user profile
 - Role-based authorization rules
@@ -46,7 +46,15 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
   - `ADMIN` role can view and delete documents across all users
   - Attempting to access or delete another user's document returns `403 Forbidden`
 - Physical file deletion on document deletion
-- Comprehensive automated test suite (42 total tests passing)
+
+### Phase 5 — Asynchronous Document Processing via Apache Kafka
+- Integration of Spring Kafka (`spring-kafka` & `spring-kafka-test`)
+- Ingestion decoupling: HTTP upload request stores file & metadata (`UPLOADED`), emits `DocumentUploadedEvent`, and returns `201 Created` immediately
+- Lightweight event payload (`DocumentUploadedEvent`): carries reference pointers (`documentId`, `ownerId`, `storagePath`, `originalFilename`) — **no raw PDF bytes**
+- Dedicated producer (`DocumentEventProducer`) publishing to configurable topic `document-uploaded`
+- Background worker (`DocumentProcessingConsumer`): listens to topic, transitions status `UPLOADED` → `PROCESSING` → `COMPLETED` (or `FAILED` if missing/unreadable file)
+- State-based idempotency: skips already `COMPLETED` documents if duplicate events arrive
+- Comprehensive automated test suite using Embedded Kafka (47 total tests passing)
 
 ---
 
@@ -57,10 +65,11 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
   java -version
   ```
 - **PostgreSQL:** Version 15 or higher (running locally or via Docker)
+- **Apache Kafka (Optional for local dev, Embedded Kafka used in tests):** Version 3.x+ or Docker
 
 ---
 
-## 2. PostgreSQL Setup
+## 2. Infrastructure Setup (Local Development)
 
 ### A. Local PostgreSQL (pgAdmin / psql)
 Connect to PostgreSQL and create the database:
@@ -68,8 +77,7 @@ Connect to PostgreSQL and create the database:
 CREATE DATABASE ai_knowledge_db;
 ```
 
-### B. Alternative: Docker Run Command
-If you prefer running PostgreSQL via Docker:
+### B. Alternative: PostgreSQL via Docker
 ```bash
 docker run --name ai-knowledge-postgres \
   -e POSTGRES_DB=ai_knowledge_db \
@@ -79,12 +87,32 @@ docker run --name ai-knowledge-postgres \
   -d postgres:16-alpine
 ```
 
+### C. Local Apache Kafka via Docker (KRaft Mode — No Zookeeper Required)
+```bash
+docker run -d --name ai-knowledge-kafka \
+  -p 9092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP='CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT' \
+  -e KAFKA_ADVERTISED_LISTENERS='PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:9092' \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+  -e KAFKA_PROCESS_ROLES='broker,controller' \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS='1@localhost:9093' \
+  -e KAFKA_LISTENERS='PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093' \
+  -e KAFKA_INTER_BROKER_LISTENER_NAME='PLAINTEXT' \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES='CONTROLLER' \
+  -e KAFKA_LOG_DIRS='/tmp/kraft-combined-logs' \
+  -e CLUSTER_ID='MkU3OEVBNTcwNTJENDM2Qk' \
+  apache/kafka:latest
+```
+
 ---
 
 ## 3. Environment Variables
 
-The application follows 12-Factor methodology and reads all configuration from environment variables.
-Safe defaults are provided for local development — **never commit real credentials or secrets**.
+The application follows 12-Factor methodology and reads configuration from environment variables.
 
 | Variable | Description | Default Value |
 | :--- | :--- | :--- |
@@ -96,25 +124,16 @@ Safe defaults are provided for local development — **never commit real credent
 | `JWT_SECRET` | HMAC-SHA256 signing key (≥ 32 chars) | `insecure-local-dev-only-secret-key...` |
 | `JWT_EXPIRATION_MS` | JWT token validity duration in milliseconds | `3600000` (1 hour) |
 | `FILE_UPLOAD_DIR` | Directory on disk for physical document storage | `uploads` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker bootstrap servers | `localhost:9092` |
+| `KAFKA_TOPIC_DOCUMENT_UPLOADED` | Kafka topic name for uploaded documents | `document-uploaded` |
 
-### Setting Environment Variables
-
-**Windows (PowerShell):**
+### Setting Environment Variables (PowerShell):
 ```powershell
 $env:DB_URL="jdbc:postgresql://localhost:5432/ai_knowledge_db"
 $env:DB_USERNAME="postgres"
-$env:DB_PASSWORD="your_secure_password"
+$env:DB_PASSWORD="postgres"
 $env:JWT_SECRET="your_strong_random_secret_key_minimum_32_chars"
-$env:FILE_UPLOAD_DIR="uploads"
-```
-
-**Linux / macOS:**
-```bash
-export DB_URL="jdbc:postgresql://localhost:5432/ai_knowledge_db"
-export DB_USERNAME="postgres"
-export DB_PASSWORD="your_secure_password"
-export JWT_SECRET="your_strong_random_secret_key_minimum_32_chars"
-export FILE_UPLOAD_DIR="uploads"
+$env:KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
 ```
 
 ---
@@ -126,151 +145,118 @@ Navigate to the `backend` directory:
 cd backend
 ```
 
-### Run Tests (uses H2 — no PostgreSQL required):
-**Windows:**
+### Run Tests (uses H2 & Embedded Kafka — no external Postgres or Kafka required):
 ```powershell
 .\mvnw.cmd test
 ```
 
-**Linux / macOS:**
-```bash
-./mvnw test
-```
-
-### Start Development Server (requires PostgreSQL):
-**Windows:**
+### Start Development Server:
 ```powershell
 .\mvnw.cmd spring-boot:run
-```
-
-**Linux / macOS:**
-```bash
-./mvnw spring-boot:run
 ```
 
 The application starts on `http://localhost:8080`.
 
 ---
 
-## 5. API Endpoints & Access Matrix
+## 5. Architecture & Asynchronous Ingestion Flow
 
-| Endpoint | Method | Required Role / Auth | Description | Success Status |
-| :--- | :--- | :--- | :--- | :--- |
-| `/api/health` | `GET` | **Public** | Returns service health status | `200 OK` |
-| `/api/auth/login` | `POST` | **Public** | Authenticate user & get JWT token | `200 OK` |
-| `/api/users` | `POST` | **Public** | Register a new user account | `201 Created` |
-| `/api/auth/me` | `GET` | `USER` or `ADMIN` | Get profile of currently authenticated user | `200 OK` |
-| `/api/users/{id}` | `GET` | `USER` or `ADMIN` | Get user by ID | `200 OK` |
-| `/api/users` | `GET` | `ADMIN` only | Get all registered users | `200 OK` |
-| `/api/users/{id}` | `DELETE` | `ADMIN` only | Delete user by ID | `200 OK` |
-| `/api/documents` | `POST` | `USER` or `ADMIN` | Upload a PDF document (`multipart/form-data`) | `201 Created` |
-| `/api/documents` | `GET` | `USER` or `ADMIN` | List documents (`USER` sees own; `ADMIN` sees all) | `200 OK` |
-| `/api/documents/{id}` | `GET` | `USER` or `ADMIN` | Get document metadata (Owner or Admin) | `200 OK` |
-| `/api/documents/{id}` | `DELETE` | `USER` or `ADMIN` | Delete document & file (Owner or Admin) | `200 OK` |
+### End-to-End Request & Event Flow
 
-### HTTP Status Codes
-
-| Code | Meaning | Scenario |
-| :--- | :--- | :--- |
-| `200 OK` | Success | Read, delete, or successful login |
-| `201 Created` | Created | User registered or document uploaded successfully |
-| `400 Bad Request` | Validation Error | Missing/empty file, non-PDF file type, or invalid filename |
-| `401 Unauthorized` | Auth Required / Bad Credentials | Missing/expired/invalid JWT, or invalid login credentials |
-| `403 Forbidden` | Access Denied | Authenticated user lacks required role or tries to access another user's document |
-| `404 Not Found` | Resource Not Found | User or document with given ID does not exist |
-| `409 Conflict` | Duplicate Resource | Email already registered |
-| `413 Payload Too Large` | Limit Exceeded | File size exceeds maximum configured limit (10MB) |
-
----
-
-## 6. Example Requests & Usage Flow
-
-### 1. Register & Login
-```bash
-# Register
-curl -X POST http://localhost:8080/api/users \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Vivek","email":"vivek@example.com","password":"MySecurePassword123"}'
-
-# Login
-curl -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"vivek@example.com","password":"MySecurePassword123"}'
 ```
+Client (HTTP Multipart Request)
+  │
+  ▼
+Spring Boot (DocumentController / DocumentService)
+  ├── 1. Store physical file on disk (uploads/)
+  ├── 2. Save Document metadata in PostgreSQL (Status: UPLOADED)
+  └── 3. Publish DocumentUploadedEvent to Kafka topic 'document-uploaded'
+  │
+  ▼
+HTTP 201 Created Response returned to Client immediately (Status: UPLOADED)
 
-### 2. Upload a PDF Document
-```bash
-curl -X POST http://localhost:8080/api/documents \
-  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
-  -F "file=@/path/to/sample.pdf"
-```
+  ───────────────────── (Asynchronous Kafka Boundary) ─────────────────────
 
-**Response (201 Created):**
-```json
-{
-  "id": 1,
-  "originalFilename": "sample.pdf",
-  "contentType": "application/pdf",
-  "fileSize": 1048576,
-  "status": "UPLOADED",
-  "createdAt": "2026-08-27T14:30:00",
-  "updatedAt": "2026-08-27T14:30:00",
-  "ownerId": 1,
-  "ownerEmail": "vivek@example.com"
-}
-```
-
-### 3. List Own Documents
-```bash
-curl http://localhost:8080/api/documents \
-  -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
-```
-
-### 4. Delete Own Document
-```bash
-curl -X DELETE http://localhost:8080/api/documents/1 \
-  -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
+Kafka Topic: document-uploaded
+  │
+  ▼
+DocumentProcessingConsumer (@KafkaListener)
+  ├── 1. Fetch Document from PostgreSQL
+  ├── 2. Idempotency Check: if status == COMPLETED, skip duplicate
+  ├── 3. Transition status UPLOADED → PROCESSING in PostgreSQL
+  ├── 4. Verify physical file existence & readability on disk
+  └── 5. Transition status PROCESSING → COMPLETED (or FAILED if unreadable)
 ```
 
 ---
 
-## 7. Architecture & Package Structure
+## 6. Document Processing & Kafka Trade-offs
 
-### Request Flow for Document Management
+### Why Asynchronous Processing with Kafka is Critical
+PDF processing in enterprise AI platforms involves CPU-heavy tasks: text extraction, chunking, embedding generation, and vector indexing. Performing these synchronously inside an HTTP request handler causes:
+- Excessive HTTP latency (seconds to minutes per file upload)
+- Servlet container thread pool exhaustion under concurrent loads
+- Client HTTP request timeouts
+
+Kafka decouples ingestion from processing, allowing instant user responses while background workers consume jobs at their own pace.
+
+### Why PDF Bytes are NOT Sent Through Kafka
+Sending binary PDF payloads over Kafka causes topic log bloat, broker RAM exhaustion, replication bottlenecks, and JVM GC spikes. Instead, we use the **Claim Check Pattern**:
+- Physical file is written to storage (local disk / S3).
+- `DocumentUploadedEvent` carries only metadata references (`documentId`, `ownerId`, `storagePath`, `originalFilename`).
+
+### Database / Storage / Kafka Consistency Limitation & Outbox Pattern
+**Limitation:** Upload involves 3 non-atomic steps:
+1. Physical file saved to disk
+2. Metadata saved to PostgreSQL
+3. Event published to Kafka
+
+If Kafka is unreachable in step 3, the database row stays `UPLOADED` without an event being published.
+
+**Transactional Outbox Pattern (Future Enhancement):**
+In production systems, `Document` and an `OutboxEvent` record are written in the *same* PostgreSQL ACID transaction. A separate process (e.g. Debezium / CDC) reads the Outbox table and publishes events to Kafka with at-least-once delivery guarantees.
+
+---
+
+## 7. Document Status State Machine & Idempotency
+
+### Status Flow
 
 ```
-HTTP Request (multipart/form-data + Bearer JWT)
-    ↓
-JwtAuthenticationFilter (Validates JWT, sets principal in SecurityContext)
-    ↓
-SecurityConfig (Checks authentication matchers for /api/documents/**)
-    ↓
-DocumentController (Parses request, passes user email & role to DocumentService)
-    ↓
-DocumentService (Validates PDF format, enforces ownership server-side)
-    ├── LocalFileStorageService (Writes physical file to disk under uploads/)
-    └── DocumentRepository (Persists metadata row to PostgreSQL)
+Normal Path:
+UPLOADED ──► PROCESSING ──► COMPLETED
+
+Failure Path:
+UPLOADED ──► PROCESSING ──► FAILED
 ```
 
-### Package Structure
+### Idempotency Behavior
+Kafka delivers messages with at-least-once semantics. If duplicate `DocumentUploadedEvent` messages arrive:
+- `DocumentProcessingConsumer` checks the current status in PostgreSQL.
+- If status is `COMPLETED`, the consumer logs an informational message and skips processing immediately.
+- If status is `FAILED`, the worker re-evaluates the file and updates state accordingly.
+
+---
+
+## 8. Package Structure
 
 ```
 com.enterprise.aiknowledge
 ├── AiKnowledgePlatformApplication.java
 │
 ├── config
-│   ├── SecurityConfig.java              ← Security matchers & filter chain
+│   ├── SecurityConfig.java
 │   └── WebMvcConfig.java
 │
 ├── controller
 │   ├── AuthController.java
-│   ├── DocumentController.java          ← POST, GET, DELETE /api/documents
+│   ├── DocumentController.java
 │   ├── HealthController.java
 │   └── UserController.java
 │
 ├── dto
 │   ├── CreateUserRequest.java
-│   ├── DocumentResponse.java            ← Document metadata DTO (no disk paths)
+│   ├── DocumentResponse.java
 │   ├── HealthResponse.java
 │   ├── LoginRequest.java
 │   ├── LoginResponse.java
@@ -279,18 +265,24 @@ com.enterprise.aiknowledge
 ├── exception
 │   ├── EmailAlreadyExistsException.java
 │   ├── ErrorResponse.java
-│   ├── GlobalExceptionHandler.java     ← Maps InvalidFileException(400), AccessDeniedException(403), MaxUploadSizeExceededException(413)
-│   ├── InvalidFileException.java       ← Bad file upload error
+│   ├── GlobalExceptionHandler.java
+│   ├── InvalidFileException.java
 │   └── ResourceNotFoundException.java
 │
+├── kafka
+│   ├── DocumentEventProducer.java       ← Publishes DocumentUploadedEvent
+│   ├── DocumentProcessingConsumer.java   ← @KafkaListener async background worker
+│   ├── DocumentUploadedEvent.java        ← Lightweight event record (no bytes)
+│   └── KafkaTopicConfig.java             ← Declares 'document-uploaded' NewTopic & KafkaAdmin
+│
 ├── model
-│   ├── Document.java                    ← JPA Entity ("documents" table)
+│   ├── Document.java
 │   ├── DocumentStatus.java              ← Enum: UPLOADED | PROCESSING | COMPLETED | FAILED
 │   ├── Role.java
 │   └── User.java
 │
 ├── repository
-│   ├── DocumentRepository.java          ← findByOwnerId, findByIdAndOwnerId
+│   ├── DocumentRepository.java
 │   └── UserRepository.java
 │
 ├── security
@@ -301,18 +293,9 @@ com.enterprise.aiknowledge
 │
 └── service
     ├── AuthService.java
-    ├── DocumentService.java             ← Upload, List, Get, Delete business logic
-    ├── FileStorageService.java          ← File storage abstraction interface
-    ├── LocalFileStorageService.java     ← Physical local disk storage implementation
+    ├── DocumentService.java             ← Upload, List, Get, Delete business logic + Kafka publish
+    ├── FileStorageService.java
+    ├── LocalFileStorageService.java
     ├── PasswordHashingService.java
     └── UserService.java
 ```
-
----
-
-## 8. Security & Storage Highlights
-
-- **Server-Side Ownership Enforcement:** Client-supplied user IDs are ignored. Ownership is determined strictly from the authenticated JWT principal.
-- **Path Traversal Protection:** Generated stored filenames combine UUID with normalized filenames, preventing path traversal attacks.
-- **Physical Clean-up:** Deleting a document metadata record automatically removes the stored physical file from disk.
-- **Storage Decoupling:** `FileStorageService` interface isolates physical storage from business logic, allowing easy transition to S3 or cloud storage in future phases without altering `DocumentService`.

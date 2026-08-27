@@ -3,6 +3,8 @@ package com.enterprise.aiknowledge.service;
 import com.enterprise.aiknowledge.dto.DocumentResponse;
 import com.enterprise.aiknowledge.exception.InvalidFileException;
 import com.enterprise.aiknowledge.exception.ResourceNotFoundException;
+import com.enterprise.aiknowledge.kafka.DocumentEventProducer;
+import com.enterprise.aiknowledge.kafka.DocumentUploadedEvent;
 import com.enterprise.aiknowledge.model.Document;
 import com.enterprise.aiknowledge.model.DocumentStatus;
 import com.enterprise.aiknowledge.model.User;
@@ -21,7 +23,7 @@ import java.util.UUID;
  * Service layer for Document Management business logic.
  *
  * <p>Orchestrates document uploads, ownership validation, storage delegation,
- * and database persistence.</p>
+ * database persistence, and asynchronous Kafka event publishing.</p>
  */
 @Service
 @Transactional
@@ -30,22 +32,25 @@ public class DocumentService {
     private final DocumentRepository documentRepository;
     private final UserRepository userRepository;
     private final FileStorageService fileStorageService;
+    private final DocumentEventProducer documentEventProducer;
 
     public DocumentService(
             DocumentRepository documentRepository,
             UserRepository userRepository,
-            FileStorageService fileStorageService) {
+            FileStorageService fileStorageService,
+            DocumentEventProducer documentEventProducer) {
         this.documentRepository = documentRepository;
         this.userRepository = userRepository;
         this.fileStorageService = fileStorageService;
+        this.documentEventProducer = documentEventProducer;
     }
 
     /**
-     * Uploads and stores a new PDF document.
+     * Uploads and stores a new PDF document and triggers background processing via Kafka.
      *
      * @param file             the uploaded multipart PDF file
      * @param currentUserEmail email of the authenticated user uploading the file
-     * @return response DTO containing document metadata
+     * @return response DTO containing document metadata with status UPLOADED
      */
     public DocumentResponse uploadDocument(MultipartFile file, String currentUserEmail) {
         // Validate file presence
@@ -83,7 +88,7 @@ public class DocumentService {
         // Store file physically
         String storagePath = fileStorageService.storeFile(file, storedFilename);
 
-        // Build entity
+        // Build entity with initial status UPLOADED
         Document document = new Document();
         document.setOwner(owner);
         document.setOriginalFilename(cleanFilename);
@@ -94,6 +99,16 @@ public class DocumentService {
         document.setStatus(DocumentStatus.UPLOADED);
 
         Document savedDocument = documentRepository.save(document);
+
+        // Publish asynchronous Kafka event for background processing
+        DocumentUploadedEvent event = new DocumentUploadedEvent(
+                savedDocument.getId(),
+                owner.getId(),
+                storagePath,
+                cleanFilename
+        );
+        documentEventProducer.sendDocumentUploadedEvent(event);
+
         return mapToResponse(savedDocument);
     }
 

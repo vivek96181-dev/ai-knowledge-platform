@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -31,29 +32,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Comprehensive integration tests for Document Management.
- *
- * <p>Tests all 14 required scenarios:
- * <ol>
- *   <li>Authenticated user uploads PDF</li>
- *   <li>Unauthenticated upload gets 401</li>
- *   <li>Invalid file type rejected (400)</li>
- *   <li>Missing file rejected (400)</li>
- *   <li>User can list own documents</li>
- *   <li>User cannot access another user's document (403)</li>
- *   <li>User cannot delete another user's document (403)</li>
- *   <li>User can retrieve own document</li>
- *   <li>User can delete own document</li>
- *   <li>Admin behavior follows configured authorization rules</li>
- *   <li>Metadata is stored correctly in database</li>
- *   <li>File is actually written to local storage</li>
- *   <li>Deleting document removes physical file from storage</li>
- *   <li>All endpoints verify security context and ownership</li>
- * </ol>
- * </p>
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@EmbeddedKafka(partitions = 1, topics = {"document-uploaded"})
 class DocumentControllerTest {
 
     @Autowired private MockMvc mockMvc;
