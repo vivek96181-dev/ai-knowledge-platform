@@ -38,6 +38,9 @@ class UserControllerTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.enterprise.aiknowledge.repository.DocumentChunkRepository documentChunkRepository;
+
+    @Autowired
     private com.enterprise.aiknowledge.repository.DocumentTextRepository documentTextRepository;
 
     @Autowired
@@ -66,6 +69,7 @@ class UserControllerTest {
      */
     @BeforeEach
     void clearDatabase() {
+        documentChunkRepository.deleteAll();
         documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();

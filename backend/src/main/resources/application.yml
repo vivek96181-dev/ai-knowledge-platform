@@ -66,4 +66,10 @@ kafka:
   topic:
     document-uploaded: ${KAFKA_TOPIC_DOCUMENT_UPLOADED:document-uploaded}
 
+# Document chunking configuration
+chunking:
+  target-size: ${CHUNKING_TARGET_SIZE:800}
+  overlap-size: ${CHUNKING_OVERLAP_SIZE:150}
+
+
 

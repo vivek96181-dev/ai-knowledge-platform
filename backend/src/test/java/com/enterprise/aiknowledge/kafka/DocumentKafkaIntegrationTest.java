@@ -2,10 +2,12 @@ package com.enterprise.aiknowledge.kafka;
 
 import com.enterprise.aiknowledge.dto.DocumentResponse;
 import com.enterprise.aiknowledge.model.Document;
+import com.enterprise.aiknowledge.model.DocumentChunk;
 import com.enterprise.aiknowledge.model.DocumentStatus;
 import com.enterprise.aiknowledge.model.DocumentText;
 import com.enterprise.aiknowledge.model.Role;
 import com.enterprise.aiknowledge.model.User;
+import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
@@ -34,6 +36,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -45,7 +48,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Integration tests verifying asynchronous Kafka document processing and PDF text extraction.
+ * Integration tests verifying asynchronous Kafka document processing, PDF text extraction, and chunk persistence.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -56,6 +59,7 @@ class DocumentKafkaIntegrationTest {
     @Autowired private MockMvc mockMvc;
     @Autowired private DocumentRepository documentRepository;
     @Autowired private DocumentTextRepository documentTextRepository;
+    @Autowired private DocumentChunkRepository documentChunkRepository;
     @Autowired private UserRepository userRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private FileStorageService fileStorageService;
@@ -71,6 +75,7 @@ class DocumentKafkaIntegrationTest {
 
     @BeforeEach
     void setUp() {
+        documentChunkRepository.deleteAll();
         documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();
@@ -84,12 +89,12 @@ class DocumentKafkaIntegrationTest {
     }
 
     // =========================================================================
-    // TEST 1: PDF upload -> Kafka -> Text Extraction -> DocumentText saved -> COMPLETED
+    // TEST 1: PDF upload -> Kafka -> Text Extraction -> DocumentText & Chunks saved -> COMPLETED
     // =========================================================================
 
     @Test
-    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, persists DocumentText, sets COMPLETED")
-    void uploadValidPdfExtractsTextAndPersistsDocumentTextAsynchronously() throws Exception {
+    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, persists DocumentText & DocumentChunks, sets COMPLETED")
+    void uploadValidPdfExtractsTextAndPersistsDocumentTextAndChunksAsynchronously() throws Exception {
         byte[] pdfBytes = createSamplePdfBytes("Enterprise AI Knowledge Platform Extraction Test", 2);
         MockMultipartFile file = new MockMultipartFile("file", "extraction_test.pdf", "application/pdf", pdfBytes);
 
@@ -109,12 +114,31 @@ class DocumentKafkaIntegrationTest {
             Document updatedDoc = documentRepository.findById(response.id()).orElseThrow();
             assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.COMPLETED);
 
+            // Verify DocumentText
             Optional<DocumentText> docTextOpt = documentTextRepository.findByDocumentId(response.id());
             assertThat(docTextOpt).isPresent();
             DocumentText docText = docTextOpt.get();
             assertThat(docText.getPageCount()).isEqualTo(2);
             assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
             assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
+
+            // Verify DocumentChunks in PostgreSQL
+            List<DocumentChunk> chunks = documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(response.id());
+            assertThat(chunks).hasSize(2);
+
+            DocumentChunk chunk0 = chunks.get(0);
+            assertThat(chunk0.getChunkIndex()).isEqualTo(0);
+            assertThat(chunk0.getPageNumber()).isEqualTo(1);
+            assertThat(chunk0.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
+            assertThat(chunk0.getCharacterStart()).isEqualTo(0);
+            assertThat(chunk0.getCharacterEnd()).isGreaterThan(0);
+
+            DocumentChunk chunk1 = chunks.get(1);
+            assertThat(chunk1.getChunkIndex()).isEqualTo(1);
+            assertThat(chunk1.getPageNumber()).isEqualTo(2);
+            assertThat(chunk1.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
+            assertThat(chunk1.getCharacterStart()).isEqualTo(0);
+            assertThat(chunk1.getCharacterEnd()).isGreaterThan(0);
         });
     }
 
@@ -165,6 +189,7 @@ class DocumentKafkaIntegrationTest {
         Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
+        assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
     }
 
     // =========================================================================
@@ -202,6 +227,7 @@ class DocumentKafkaIntegrationTest {
         Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
+        assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
 
         Files.deleteIfExists(corruptFilePath);
     }
@@ -211,7 +237,7 @@ class DocumentKafkaIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer skips duplicate events for COMPLETED documents without creating duplicate DocumentText records")
+    @DisplayName("Consumer skips duplicate events for COMPLETED documents without creating duplicate DocumentText or DocumentChunk records")
     void duplicateKafkaEventIsIdempotent() throws Exception {
         byte[] pdfBytes = createSamplePdfBytes("Idempotency Test Content", 1);
         Path uploadDir = Paths.get("uploads-test").toAbsolutePath().normalize();
@@ -240,8 +266,10 @@ class DocumentKafkaIntegrationTest {
         documentProcessingConsumer.consume(event);
         assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isPresent();
+        assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isTrue();
 
         long initialTextRecordCount = documentTextRepository.count();
+        long initialChunkRecordCount = documentChunkRepository.count();
 
         // Duplicate consume call
         documentProcessingConsumer.consume(event);
@@ -249,6 +277,7 @@ class DocumentKafkaIntegrationTest {
         // Verify status remains COMPLETED and record count did not increase
         assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
         assertThat(documentTextRepository.count()).isEqualTo(initialTextRecordCount);
+        assertThat(documentChunkRepository.count()).isEqualTo(initialChunkRecordCount);
 
         Files.deleteIfExists(pdfPath);
     }
