@@ -53,4 +53,9 @@ kafka:
   topic:
     document-uploaded: document-uploaded
 
+chunking:
+  target-size: 800
+  overlap-size: 150
+
+
 

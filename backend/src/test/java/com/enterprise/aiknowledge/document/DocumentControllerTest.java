@@ -41,6 +41,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class DocumentControllerTest {
 
     @Autowired private MockMvc mockMvc;
+    @Autowired private com.enterprise.aiknowledge.repository.DocumentChunkRepository documentChunkRepository;
     @Autowired private DocumentRepository documentRepository;
     @Autowired private DocumentTextRepository documentTextRepository;
     @Autowired private UserRepository userRepository;
@@ -61,6 +62,7 @@ class DocumentControllerTest {
 
     @BeforeEach
     void setUp() {
+        documentChunkRepository.deleteAll();
         documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();

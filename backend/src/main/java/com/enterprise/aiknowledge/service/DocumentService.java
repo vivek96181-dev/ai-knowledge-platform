@@ -32,6 +32,7 @@ public class DocumentService {
 
     private final DocumentRepository documentRepository;
     private final DocumentTextRepository documentTextRepository;
+    private final com.enterprise.aiknowledge.repository.DocumentChunkRepository documentChunkRepository;
     private final UserRepository userRepository;
     private final FileStorageService fileStorageService;
     private final DocumentEventProducer documentEventProducer;
@@ -39,11 +40,13 @@ public class DocumentService {
     public DocumentService(
             DocumentRepository documentRepository,
             DocumentTextRepository documentTextRepository,
+            com.enterprise.aiknowledge.repository.DocumentChunkRepository documentChunkRepository,
             UserRepository userRepository,
             FileStorageService fileStorageService,
             DocumentEventProducer documentEventProducer) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
+        this.documentChunkRepository = documentChunkRepository;
         this.userRepository = userRepository;
         this.fileStorageService = fileStorageService;
         this.documentEventProducer = documentEventProducer;
@@ -183,6 +186,9 @@ public class DocumentService {
 
         // Delete physical file from storage
         fileStorageService.deleteFile(document.getStoragePath());
+
+        // Delete associated chunks first (child records)
+        documentChunkRepository.deleteByDocumentId(document.getId());
 
         // Delete associated extracted text if present
         documentTextRepository.deleteByDocumentId(document.getId());

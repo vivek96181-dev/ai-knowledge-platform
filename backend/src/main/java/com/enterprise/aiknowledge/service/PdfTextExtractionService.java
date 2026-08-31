@@ -12,13 +12,15 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Service responsible for extracting plain text content and page count from PDF files using Apache PDFBox.
+ * Service responsible for extracting plain text content and page metadata from PDF files using Apache PDFBox.
  *
  * <p><strong>Architectural Rationale:</strong><br>
  * Apache PDFBox runs natively inside the JVM without external CLI tool installations, native library dependencies,
- * or paid cloud service requirements. It provides efficient text stripping and document layout parsing.</p>
+ * or paid cloud service requirements. It provides efficient text stripping and page-level layout parsing.</p>
  */
 @Service
 public class PdfTextExtractionService {
@@ -26,10 +28,10 @@ public class PdfTextExtractionService {
     private static final Logger log = LoggerFactory.getLogger(PdfTextExtractionService.class);
 
     /**
-     * Parses the PDF file at the specified path and extracts plain text along with page count.
+     * Parses the PDF file at the specified path and extracts plain text along with page count and per-page text.
      *
      * @param filePath absolute path to the PDF file on storage
-     * @return {@link PdfExtractionResult} containing normalized text and page count
+     * @return {@link PdfExtractionResult} containing full normalized text, page count, and page-by-page text list
      * @throws InvalidFileException if the file is missing, unreadable, or not a valid PDF
      */
     public PdfExtractionResult extractText(Path filePath) {
@@ -50,11 +52,28 @@ public class PdfTextExtractionService {
             log.info("Successfully loaded PDF from path: {}. Page count: {}", filePath, pageCount);
 
             PDFTextStripper stripper = new PDFTextStripper();
-            String rawText = stripper.getText(pdDocument);
+            List<PageText> pages = new ArrayList<>();
+            StringBuilder fullTextBuilder = new StringBuilder();
 
-            String normalizedText = normalizeText(rawText);
+            for (int pageNum = 1; pageNum <= pageCount; pageNum++) {
+                stripper.setStartPage(pageNum);
+                stripper.setEndPage(pageNum);
 
-            return new PdfExtractionResult(normalizedText, pageCount);
+                String pageRawText = stripper.getText(pdDocument);
+                String normalizedPageText = normalizeText(pageRawText);
+
+                pages.add(new PageText(pageNum, normalizedPageText));
+
+                if (!normalizedPageText.isBlank()) {
+                    if (!fullTextBuilder.isEmpty()) {
+                        fullTextBuilder.append("\n\n");
+                    }
+                    fullTextBuilder.append(normalizedPageText);
+                }
+            }
+
+            String fullText = fullTextBuilder.toString().trim();
+            return new PdfExtractionResult(fullText, pageCount, pages);
         } catch (IOException ex) {
             log.error("Failed to parse or extract text from PDF at path: {}", filePath, ex);
             throw new InvalidFileException("Failed to extract text from invalid or corrupt PDF at path: " + filePath);
@@ -72,7 +91,7 @@ public class PdfTextExtractionService {
      * @param rawText raw text stripped from PDF
      * @return clean normalized text string
      */
-    private String normalizeText(String rawText) {
+    public String normalizeText(String rawText) {
         if (rawText == null) {
             return "";
         }
