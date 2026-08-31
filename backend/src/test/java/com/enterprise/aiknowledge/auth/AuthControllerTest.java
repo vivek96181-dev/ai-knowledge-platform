@@ -2,6 +2,8 @@ package com.enterprise.aiknowledge.auth;
 
 import com.enterprise.aiknowledge.model.Role;
 import com.enterprise.aiknowledge.model.User;
+import com.enterprise.aiknowledge.repository.DocumentRepository;
+import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,8 +41,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class AuthControllerTest {
 
     @Autowired private MockMvc mockMvc;
+    @Autowired private DocumentRepository documentRepository;
+    @Autowired private DocumentTextRepository documentTextRepository;
     @Autowired private UserRepository userRepository;
-    @Autowired private com.enterprise.aiknowledge.repository.DocumentRepository documentRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private ObjectMapper objectMapper;
 
@@ -66,6 +69,7 @@ class AuthControllerTest {
      */
     @BeforeEach
     void setUp() {
+        documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();
 
