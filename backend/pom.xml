@@ -98,6 +98,13 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
+        <!-- Apache PDFBox: Open-source PDF text extraction and document parsing -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>3.0.3</version>
+        </dependency>
+
         <!-- Spring Boot Starter Test: JUnit 5, Mockito, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

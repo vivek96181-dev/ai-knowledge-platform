@@ -9,6 +9,7 @@ import com.enterprise.aiknowledge.model.Document;
 import com.enterprise.aiknowledge.model.DocumentStatus;
 import com.enterprise.aiknowledge.model.User;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
+import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
@@ -30,16 +31,19 @@ import java.util.UUID;
 public class DocumentService {
 
     private final DocumentRepository documentRepository;
+    private final DocumentTextRepository documentTextRepository;
     private final UserRepository userRepository;
     private final FileStorageService fileStorageService;
     private final DocumentEventProducer documentEventProducer;
 
     public DocumentService(
             DocumentRepository documentRepository,
+            DocumentTextRepository documentTextRepository,
             UserRepository userRepository,
             FileStorageService fileStorageService,
             DocumentEventProducer documentEventProducer) {
         this.documentRepository = documentRepository;
+        this.documentTextRepository = documentTextRepository;
         this.userRepository = userRepository;
         this.fileStorageService = fileStorageService;
         this.documentEventProducer = documentEventProducer;
@@ -179,6 +183,9 @@ public class DocumentService {
 
         // Delete physical file from storage
         fileStorageService.deleteFile(document.getStoragePath());
+
+        // Delete associated extracted text if present
+        documentTextRepository.deleteByDocumentId(document.getId());
 
         // Delete metadata row from database
         documentRepository.delete(document);

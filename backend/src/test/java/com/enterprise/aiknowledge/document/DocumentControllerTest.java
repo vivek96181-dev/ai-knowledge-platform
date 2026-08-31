@@ -5,6 +5,7 @@ import com.enterprise.aiknowledge.model.DocumentStatus;
 import com.enterprise.aiknowledge.model.Role;
 import com.enterprise.aiknowledge.model.User;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
+import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
 import com.enterprise.aiknowledge.service.LocalFileStorageService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
@@ -41,6 +42,7 @@ class DocumentControllerTest {
 
     @Autowired private MockMvc mockMvc;
     @Autowired private DocumentRepository documentRepository;
+    @Autowired private DocumentTextRepository documentTextRepository;
     @Autowired private UserRepository userRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private LocalFileStorageService fileStorageService;
@@ -59,6 +61,7 @@ class DocumentControllerTest {
 
     @BeforeEach
     void setUp() {
+        documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();
 

@@ -3,13 +3,20 @@ package com.enterprise.aiknowledge.kafka;
 import com.enterprise.aiknowledge.dto.DocumentResponse;
 import com.enterprise.aiknowledge.model.Document;
 import com.enterprise.aiknowledge.model.DocumentStatus;
+import com.enterprise.aiknowledge.model.DocumentText;
 import com.enterprise.aiknowledge.model.Role;
 import com.enterprise.aiknowledge.model.User;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
+import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
 import com.enterprise.aiknowledge.service.FileStorageService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -22,10 +29,12 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
-import java.io.File;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,19 +45,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Integration tests verifying asynchronous Kafka document processing using an Embedded Kafka Broker.
- *
- * <p><strong>Scenarios Tested:</strong>
- * <ol>
- *   <li>Document upload creates metadata, writes physical file, returns status UPLOADED immediately.</li>
- *   <li>DocumentUploadedEvent is published and consumed asynchronously.</li>
- *   <li>Consumer transitions status UPLOADED → PROCESSING → COMPLETED.</li>
- *   <li>Missing document ID in consumer is handled safely without exception throwing.</li>
- *   <li>Missing physical file results in FAILED status.</li>
- *   <li>Empty/unreadable physical file results in FAILED status.</li>
- *   <li>Duplicate event for an already COMPLETED document is skipped (idempotent).</li>
- * </ol>
- * </p>
+ * Integration tests verifying asynchronous Kafka document processing and PDF text extraction.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -58,6 +55,7 @@ class DocumentKafkaIntegrationTest {
 
     @Autowired private MockMvc mockMvc;
     @Autowired private DocumentRepository documentRepository;
+    @Autowired private DocumentTextRepository documentTextRepository;
     @Autowired private UserRepository userRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private FileStorageService fileStorageService;
@@ -73,6 +71,7 @@ class DocumentKafkaIntegrationTest {
 
     @BeforeEach
     void setUp() {
+        documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();
 
@@ -85,16 +84,16 @@ class DocumentKafkaIntegrationTest {
     }
 
     // =========================================================================
-    // TEST 1 & 2 & 3 & 4 & 5: Upload returns UPLOADED immediately → Consumer sets COMPLETED asynchronously
+    // TEST 1: PDF upload -> Kafka -> Text Extraction -> DocumentText saved -> COMPLETED
     // =========================================================================
 
     @Test
-    @DisplayName("Upload returns UPLOADED immediately; Kafka consumer asynchronously transitions UPLOADED -> PROCESSING -> COMPLETED")
-    void uploadReturnsUploadedImmediatelyAndConsumerCompletesAsynchronously() throws Exception {
-        byte[] pdfBytes = "%PDF-1.4 Asynchronous Kafka Processing Content".getBytes();
-        MockMultipartFile file = new MockMultipartFile("file", "async_report.pdf", "application/pdf", pdfBytes);
+    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, persists DocumentText, sets COMPLETED")
+    void uploadValidPdfExtractsTextAndPersistsDocumentTextAsynchronously() throws Exception {
+        byte[] pdfBytes = createSamplePdfBytes("Enterprise AI Knowledge Platform Extraction Test", 2);
+        MockMultipartFile file = new MockMultipartFile("file", "extraction_test.pdf", "application/pdf", pdfBytes);
 
-        // Step 1: Upload file via HTTP
+        // Step 1: Upload via HTTP API
         MvcResult result = mockMvc.perform(multipart(BASE_URL)
                         .file(file)
                         .with(user(USER_EMAIL).roles("USER")))
@@ -105,24 +104,26 @@ class DocumentKafkaIntegrationTest {
         DocumentResponse response = objectMapper.readValue(
                 result.getResponse().getContentAsString(), DocumentResponse.class);
 
-        // Step 2: Verify immediate state in DB & storage
-        Document docInDb = documentRepository.findById(response.id()).orElseThrow();
-        assertThat(docInDb.getOriginalFilename()).isEqualTo("async_report.pdf");
-        assertThat(fileStorageService.fileExists(docInDb.getStoragePath())).isTrue();
-
-        // Step 3: Await asynchronous consumer execution (UPLOADED -> PROCESSING -> COMPLETED)
+        // Step 2: Await consumer processing
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
             Document updatedDoc = documentRepository.findById(response.id()).orElseThrow();
             assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.COMPLETED);
+
+            Optional<DocumentText> docTextOpt = documentTextRepository.findByDocumentId(response.id());
+            assertThat(docTextOpt).isPresent();
+            DocumentText docText = docTextOpt.get();
+            assertThat(docText.getPageCount()).isEqualTo(2);
+            assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
+            assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
         });
     }
 
     // =========================================================================
-    // TEST 6: Missing document handled safely
+    // TEST 2: Missing document ID handled safely
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer handles non-existent document ID safely without failing")
+    @DisplayName("Consumer handles non-existent document ID safely without throwing exceptions")
     void consumerHandlesMissingDocumentSafely() {
         DocumentUploadedEvent event = new DocumentUploadedEvent(
                 999999L,
@@ -131,18 +132,16 @@ class DocumentKafkaIntegrationTest {
                 "missing.pdf"
         );
 
-        // Direct consumer execution — must complete without throwing exceptions
         documentProcessingConsumer.consume(event);
-
         assertThat(documentRepository.findById(999999L)).isEmpty();
     }
 
     // =========================================================================
-    // TEST 7: Missing physical file results in FAILED
+    // TEST 3: Missing physical file results in FAILED
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer sets document status to FAILED when physical file does not exist on disk")
+    @DisplayName("Consumer sets status to FAILED when physical file is missing from disk")
     void missingPhysicalFileResultsInFailedStatus() {
         Document doc = new Document();
         doc.setOwner(testUser);
@@ -165,29 +164,29 @@ class DocumentKafkaIntegrationTest {
 
         Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
+        assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
     }
 
     // =========================================================================
-    // TEST 8: Unreadable / Empty file results in FAILED
+    // TEST 4: Corrupt PDF results in FAILED status
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer sets document status to FAILED when physical file is empty (0 bytes)")
-    void emptyFileResultsInFailedStatus() throws Exception {
-        // Create a 0-byte file in upload directory
-        String emptyFilename = "empty_test_file.pdf";
+    @DisplayName("Consumer sets status to FAILED when physical PDF file is corrupt/invalid")
+    void corruptPdfResultsInFailedStatus() throws Exception {
+        String corruptFilename = "corrupt_test_file.pdf";
         Path uploadDir = Paths.get("uploads-test").toAbsolutePath().normalize();
         Files.createDirectories(uploadDir);
-        Path emptyFilePath = uploadDir.resolve(emptyFilename);
-        Files.write(emptyFilePath, new byte[0]);
+        Path corruptFilePath = uploadDir.resolve(corruptFilename);
+        Files.write(corruptFilePath, "Not a valid PDF format content".getBytes());
 
         Document doc = new Document();
         doc.setOwner(testUser);
-        doc.setOriginalFilename(emptyFilename);
-        doc.setStoredFilename(emptyFilename);
+        doc.setOriginalFilename(corruptFilename);
+        doc.setStoredFilename(corruptFilename);
         doc.setContentType("application/pdf");
-        doc.setFileSize(0L);
-        doc.setStoragePath(emptyFilePath.toString());
+        doc.setFileSize((long) "Not a valid PDF format content".getBytes().length);
+        doc.setStoragePath(corruptFilePath.toString());
         doc.setStatus(DocumentStatus.UPLOADED);
         doc = documentRepository.save(doc);
 
@@ -202,26 +201,32 @@ class DocumentKafkaIntegrationTest {
 
         Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
+        assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
 
-        // Clean up temp file
-        Files.deleteIfExists(emptyFilePath);
+        Files.deleteIfExists(corruptFilePath);
     }
 
     // =========================================================================
-    // TEST 9: Duplicate event does not process a COMPLETED document again
+    // TEST 5: Duplicate Kafka event is idempotent
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer skips processing when document is already COMPLETED (idempotent)")
-    void duplicateEventSkipsAlreadyCompletedDocument() {
+    @DisplayName("Consumer skips duplicate events for COMPLETED documents without creating duplicate DocumentText records")
+    void duplicateKafkaEventIsIdempotent() throws Exception {
+        byte[] pdfBytes = createSamplePdfBytes("Idempotency Test Content", 1);
+        Path uploadDir = Paths.get("uploads-test").toAbsolutePath().normalize();
+        Files.createDirectories(uploadDir);
+        Path pdfPath = uploadDir.resolve("idempotent_doc.pdf");
+        Files.write(pdfPath, pdfBytes);
+
         Document doc = new Document();
         doc.setOwner(testUser);
-        doc.setOriginalFilename("already_done.pdf");
-        doc.setStoredFilename("already_done.pdf");
+        doc.setOriginalFilename("idempotent_doc.pdf");
+        doc.setStoredFilename("idempotent_doc.pdf");
         doc.setContentType("application/pdf");
-        doc.setFileSize(200L);
-        doc.setStoragePath("/path/to/already_done.pdf");
-        doc.setStatus(DocumentStatus.COMPLETED);
+        doc.setFileSize((long) pdfBytes.length);
+        doc.setStoragePath(pdfPath.toString());
+        doc.setStatus(DocumentStatus.UPLOADED);
         doc = documentRepository.save(doc);
 
         DocumentUploadedEvent event = new DocumentUploadedEvent(
@@ -231,10 +236,39 @@ class DocumentKafkaIntegrationTest {
                 doc.getOriginalFilename()
         );
 
+        // First consume call
+        documentProcessingConsumer.consume(event);
+        assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
+        assertThat(documentTextRepository.findByDocumentId(doc.getId())).isPresent();
+
+        long initialTextRecordCount = documentTextRepository.count();
+
+        // Duplicate consume call
         documentProcessingConsumer.consume(event);
 
-        // Status remains COMPLETED
-        Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
-        assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.COMPLETED);
+        // Verify status remains COMPLETED and record count did not increase
+        assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
+        assertThat(documentTextRepository.count()).isEqualTo(initialTextRecordCount);
+
+        Files.deleteIfExists(pdfPath);
+    }
+
+    private byte[] createSamplePdfBytes(String text, int pages) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            for (int i = 1; i <= pages; i++) {
+                PDPage page = new PDPage();
+                doc.addPage(page);
+                try (PDPageContentStream contents = new PDPageContentStream(doc, page)) {
+                    contents.beginText();
+                    contents.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 12);
+                    contents.newLineAtOffset(100, 700);
+                    contents.showText(text + " - Page " + i);
+                    contents.endText();
+                }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            doc.save(out);
+            return out.toByteArray();
+        }
     }
 }
