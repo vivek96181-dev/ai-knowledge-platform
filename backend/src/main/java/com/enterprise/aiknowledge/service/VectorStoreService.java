@@ -34,6 +34,16 @@ public interface VectorStoreService {
     void deleteVectorsByDocumentId(Long documentId);
 
     /**
+     * Performs a semantic nearest-neighbor search using the query vector.
+     *
+     * @param queryVector embedding vector of the search query
+     * @param topK        maximum number of matching points to retrieve
+     * @param ownerId     optional owner ID filter (if non-null, restricts search to documents owned by this user)
+     * @return ordered list of scored chunk DTOs matching the query
+     */
+    List<ScoredChunkDto> search(List<Float> queryVector, int topK, Long ownerId);
+
+    /**
      * Returns the name of the target vector collection.
      */
     String getCollectionName();

@@ -75,6 +75,11 @@ qdrant:
   use-tls: false
   api-key: ""
 
+search:
+  default-top-k: 5
+  max-top-k: 20
+
+
 
 
 

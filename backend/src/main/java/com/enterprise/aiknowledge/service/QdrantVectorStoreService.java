@@ -6,6 +6,8 @@ import io.qdrant.client.QdrantClient;
 import io.qdrant.client.QdrantGrpcClient;
 import io.qdrant.client.ValueFactory;
 import io.qdrant.client.VectorsFactory;
+import io.qdrant.client.WithPayloadSelectorFactory;
+import io.qdrant.client.WithVectorsSelectorFactory;
 import io.qdrant.client.grpc.Collections.CollectionInfo;
 import io.qdrant.client.grpc.Collections.CreateCollection;
 import io.qdrant.client.grpc.Collections.Distance;
@@ -13,6 +15,8 @@ import io.qdrant.client.grpc.Collections.VectorParams;
 import io.qdrant.client.grpc.Collections.VectorsConfig;
 import io.qdrant.client.grpc.Common.Filter;
 import io.qdrant.client.grpc.Points.PointStruct;
+import io.qdrant.client.grpc.Points.ScoredPoint;
+import io.qdrant.client.grpc.Points.SearchPoints;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,6 +64,7 @@ public class QdrantVectorStoreService implements VectorStoreService {
         CollectionInfo getCollectionInfo(String collectionName) throws Exception;
         void upsert(String collectionName, List<PointStruct> points) throws Exception;
         void delete(String collectionName, Filter filter) throws Exception;
+        List<io.qdrant.client.grpc.Points.ScoredPoint> search(io.qdrant.client.grpc.Points.SearchPoints searchPoints) throws Exception;
     }
 
     private static class DefaultQdrantClientAdapter implements QdrantClientAdapter {
@@ -105,6 +110,11 @@ public class QdrantVectorStoreService implements VectorStoreService {
         @Override
         public void delete(String collectionName, Filter filter) throws Exception {
             client.deleteAsync(collectionName, filter).get();
+        }
+
+        @Override
+        public List<io.qdrant.client.grpc.Points.ScoredPoint> search(io.qdrant.client.grpc.Points.SearchPoints searchPoints) throws Exception {
+            return client.searchAsync(searchPoints).get();
         }
     }
 
@@ -279,6 +289,61 @@ public class QdrantVectorStoreService implements VectorStoreService {
         } catch (Exception ex) {
             Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
             throw new RuntimeException("Qdrant delete failed for documentId " + documentId + ": " + cause.getMessage(), cause);
+        }
+    }
+
+    @Override
+    public List<ScoredChunkDto> search(List<Float> queryVector, int topK, Long ownerId) {
+        if (queryVector == null || queryVector.size() != vectorDimensions) {
+            throw new IllegalStateException(String.format(
+                    "Query vector dimension mismatch: expected %d, but was %d",
+                    vectorDimensions, queryVector != null ? queryVector.size() : 0));
+        }
+        if (topK <= 0) {
+            throw new IllegalArgumentException("topK must be greater than 0, but was: " + topK);
+        }
+
+        log.info("Searching Qdrant collection '{}' for top-{} nearest neighbors (ownerId filter: {})...",
+                collectionName, topK, ownerId);
+
+        SearchPoints.Builder searchBuilder = SearchPoints.newBuilder()
+                .setCollectionName(collectionName)
+                .addAllVector(queryVector)
+                .setLimit(topK)
+                .setWithPayload(WithPayloadSelectorFactory.enable(true))
+                .setWithVectors(WithVectorsSelectorFactory.enable(false));
+
+        if (ownerId != null) {
+            Filter filter = Filter.newBuilder()
+                    .addMust(ConditionFactory.match("ownerId", ownerId))
+                    .build();
+            searchBuilder.setFilter(filter);
+        }
+
+        try {
+            List<ScoredPoint> scoredPoints = clientAdapter.search(searchBuilder.build());
+            log.info("Qdrant returned {} matching points", scoredPoints.size());
+
+            List<ScoredChunkDto> results = new ArrayList<>(scoredPoints.size());
+            for (ScoredPoint point : scoredPoints) {
+                Long chunkId = point.getId().getNum();
+                float score = point.getScore();
+
+                var payload = point.getPayloadMap();
+                Long docId = payload.containsKey("documentId") ? payload.get("documentId").getIntegerValue() : null;
+                int pageNumber = payload.containsKey("pageNumber") ? (int) payload.get("pageNumber").getIntegerValue() : 0;
+                int chunkIndex = payload.containsKey("chunkIndex") ? (int) payload.get("chunkIndex").getIntegerValue() : 0;
+                Long pointOwnerId = payload.containsKey("ownerId") ? payload.get("ownerId").getIntegerValue() : null;
+
+                results.add(new ScoredChunkDto(chunkId, docId, pageNumber, chunkIndex, pointOwnerId, score));
+            }
+            return results;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted during Qdrant vector search in collection: " + collectionName, ie);
+        } catch (Exception ex) {
+            Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
+            throw new RuntimeException("Qdrant vector search failed for collection '" + collectionName + "': " + cause.getMessage(), cause);
         }
     }
 

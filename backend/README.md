@@ -192,6 +192,40 @@ com.enterprise.aiknowledge
 ├── model
 │   ├── Document.java                     ← Metadata table ("documents")
 │   ├── DocumentChunk.java                ← Chunks table ("document_chunks")
+├── controller
+│   ├── AuthController.java
+│   ├── DocumentController.java
+│   ├── HealthController.java
+│   ├── SearchController.java             ← Semantic search endpoint (POST /api/search)
+│   └── UserController.java
+│
+├── dto
+│   ├── CreateUserRequest.java
+│   ├── DocumentResponse.java
+│   ├── HealthResponse.java
+│   ├── LoginRequest.java
+│   ├── LoginResponse.java
+│   ├── ScoredChunkDto.java
+│   ├── SearchRequest.java                ← Query & topK request payload
+│   ├── SearchResponse.java               ← Ranked results response container
+│   ├── SearchResult.java                 ← Ranked chunk match with score & text
+│   └── UserResponse.java
+│
+├── exception
+│   ├── EmailAlreadyExistsException.java
+│   ├── ErrorResponse.java
+│   ├── GlobalExceptionHandler.java
+│   ├── InvalidFileException.java
+│   └── ResourceNotFoundException.java
+│
+├── kafka
+│   ├── DocumentEventProducer.java
+│   ├── DocumentProcessingConsumer.java   ← Background worker (text -> chunk -> embed -> Qdrant)
+│   └── DocumentUploadedEvent.java
+│
+├── model
+│   ├── Document.java
+│   ├── DocumentChunk.java                ← Text chunk entity ("document_chunks")
 │   ├── DocumentChunkEmbedding.java       ← Embedding metadata table ("document_chunk_embeddings")
 │   ├── DocumentStatus.java               ← UPLOADED | PROCESSING | COMPLETED | FAILED
 │   ├── DocumentText.java                 ← Extracted text table ("document_texts")
@@ -200,7 +234,7 @@ com.enterprise.aiknowledge
 │
 ├── repository
 │   ├── DocumentChunkEmbeddingRepository.java ← Embedding metadata queries & lifecycle
-│   ├── DocumentChunkRepository.java          ← Chunk queries & lifecycle
+│   ├── DocumentChunkRepository.java          ← Chunk queries & batch fetch
 │   ├── DocumentRepository.java
 │   ├── DocumentTextRepository.java           ← Extracted text repository queries
 │   └── UserRepository.java
@@ -225,6 +259,8 @@ com.enterprise.aiknowledge
     ├── PdfExtractionResult.java          ← Text + page count + PageText list DTO
     ├── PdfTextExtractionService.java     ← Apache PDFBox extraction engine
     ├── QdrantVectorStoreService.java     ← Qdrant vector database service (gRPC)
+    ├── ScoredChunkDto.java               ← Domain DTO for vector search matches
+    ├── SemanticSearchService.java        ← Semantic search orchestrator
     ├── UserService.java
     └── VectorStoreService.java           ← Vector store abstraction interface
 ```
@@ -336,5 +372,96 @@ cd backend
 - **Check Qdrant Logs**:
   `docker compose -f infrastructure/docker-compose.yml logs -f qdrant`
 - **Verify Web UI**: Visit `http://localhost:6333/dashboard` in a web browser to inspect collections and vector counts visually.
+
+---
+
+## Semantic Vector Similarity Search (`feature/semantic-search`)
+
+### 1. High-Level Flow
+```
+User Question (POST /api/search)
+       │
+       ▼
+Query Embedding (Gemini Embedding 2: gemini-embedding-2, 768 dimensions)
+       │
+       ▼
+Qdrant Approximate Nearest Neighbors (ANN) Query (Cosine metric)
+       │  ├── Standard USER: filter by payload "ownerId == currentUser.id"
+       │  └── ADMIN: no owner filter (cross-tenant search permitted)
+       ▼
+Top-K Matching Vector Points (point ID = chunkId, similarity score)
+       │
+       ▼
+PostgreSQL Batch Retrieval (findAllWithDocumentAndOwnerByIdIn via JOIN FETCH)
+       │  ├── Preserves Qdrant relevance score ranking order
+       │  ├── Safely drops stale Qdrant points (missing in PostgreSQL)
+       │  └── Secondary defense-in-depth ownership verification
+       ▼
+Structured SearchResponse (query, ranked results with documentId, chunkId, pageNumber, score, text)
+```
+
+### 2. Search Endpoint Specification
+
+#### `POST /api/search`
+Authenticated endpoint allowing users to search their documents using natural language.
+
+**Headers:**
+- `Authorization: Bearer <JWT_TOKEN>`
+- `Content-Type: application/json`
+
+**Request Body:**
+```json
+{
+  "query": "What is the company leave policy?",
+  "topK": 5
+}
+```
+
+**Field Rules:**
+- `query` (string, required): Cannot be blank. Leading/trailing whitespace is trimmed. Maximum 1000 characters.
+- `topK` (integer, optional): Number of top matches to retrieve. Defaults to `search.default-top-k` (5). Must be between 1 and `search.max-top-k` (20).
+
+**Response Body (`200 OK`):**
+```json
+{
+  "query": "What is the company leave policy?",
+  "results": [
+    {
+      "documentId": 12,
+      "chunkId": 45,
+      "pageNumber": 7,
+      "chunkIndex": 3,
+      "score": 0.8932,
+      "text": "Employees are eligible for 20 days of paid annual leave each calendar year..."
+    },
+    {
+      "documentId": 12,
+      "chunkId": 46,
+      "pageNumber": 8,
+      "chunkIndex": 4,
+      "score": 0.8617,
+      "text": "Unused leave may be carried forward up to a maximum of 5 days into the next year..."
+    }
+  ]
+}
+```
+
+**Security Invariants:**
+- Zero raw vector coordinates or embeddings are returned in the response.
+- Server filesystem paths (`storagePath`, `storedFilename`) are never exposed.
+- Non-admin callers only retrieve chunks belonging to documents they own.
+
+### 3. Example `curl` Request
+
+```bash
+curl -X POST http://localhost:8080/api/search \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How are performance reviews conducted?",
+    "topK": 3
+  }'
+```
+
 
 

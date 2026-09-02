@@ -42,4 +42,17 @@ public interface DocumentChunkRepository extends JpaRepository<DocumentChunk, Lo
      * @return count of chunks
      */
     long countByDocumentId(Long documentId);
+
+    /**
+     * Batch-retrieves document chunks along with their parent document and owner eagerly,
+     * preventing N+1 queries during semantic search chunk retrieval.
+     *
+     * @param ids collection of chunk IDs
+     * @return list of document chunks with initialized document and owner associations
+     */
+    @org.springframework.data.jpa.repository.Query(
+            "SELECT c FROM DocumentChunk c JOIN FETCH c.document d JOIN FETCH d.owner WHERE c.id IN :ids"
+    )
+    List<DocumentChunk> findAllWithDocumentAndOwnerByIdIn(
+            @org.springframework.data.repository.query.Param("ids") java.util.Collection<Long> ids);
 }

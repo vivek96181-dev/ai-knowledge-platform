@@ -71,6 +71,24 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * Handles illegal argument exceptions (e.g. invalid query or topK parameter).
+     * Returns HTTP 400 Bad Request.
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ErrorResponse> handleIllegalArgumentException(
+            IllegalArgumentException ex,
+            HttpServletRequest request
+    ) {
+        ErrorResponse errorResponse = new ErrorResponse(
+                HttpStatus.BAD_REQUEST.value(),
+                HttpStatus.BAD_REQUEST.getReasonPhrase(),
+                ex.getMessage(),
+                request.getRequestURI()
+        );
+        return new ResponseEntity<>(errorResponse, HttpStatus.BAD_REQUEST);
+    }
+
+    /**
      * Handles server-side authorization failures (e.g. user trying to access another user's document).
      * Returns HTTP 403 Forbidden.
      */
