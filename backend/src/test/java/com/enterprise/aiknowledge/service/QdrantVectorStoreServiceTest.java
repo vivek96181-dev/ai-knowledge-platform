@@ -208,4 +208,89 @@ class QdrantVectorStoreServiceTest {
 
         verify(mockAdapter).delete(eq(TEST_COLLECTION), any(Filter.class));
     }
+
+    @Test
+    @DisplayName("search throws IllegalStateException when query vector dimension does not match configured dimensions")
+    void searchDimensionMismatchThrowsException() {
+        QdrantVectorStoreService service = new QdrantVectorStoreService(
+                "localhost", 6333, 6334, TEST_COLLECTION, TEST_DIMENSIONS, false, "", mockAdapter);
+
+        List<Float> invalid512Vector = Collections.nCopies(512, 0.01f);
+
+        assertThatThrownBy(() -> service.search(invalid512Vector, 5, 1L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("dimension mismatch")
+                .hasMessageContaining("expected 768, but was 512");
+    }
+
+    @Test
+    @DisplayName("search throws IllegalArgumentException when topK is non-positive")
+    void searchInvalidTopKThrowsException() {
+        QdrantVectorStoreService service = new QdrantVectorStoreService(
+                "localhost", 6333, 6334, TEST_COLLECTION, TEST_DIMENSIONS, false, "", mockAdapter);
+
+        assertThatThrownBy(() -> service.search(valid768Vector, 0, 1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("topK must be greater than 0");
+    }
+
+    @Test
+    @DisplayName("search applies ownerId filter when ownerId is provided")
+    void searchWithOwnerIdFilter() throws Exception {
+        QdrantVectorStoreService service = new QdrantVectorStoreService(
+                "localhost", 6333, 6334, TEST_COLLECTION, TEST_DIMENSIONS, false, "", mockAdapter);
+
+        io.qdrant.client.grpc.Points.ScoredPoint point = io.qdrant.client.grpc.Points.ScoredPoint.newBuilder()
+                .setId(io.qdrant.client.PointIdFactory.id(101L))
+                .setScore(0.92f)
+                .putPayload("documentId", io.qdrant.client.ValueFactory.value(201L))
+                .putPayload("documentChunkId", io.qdrant.client.ValueFactory.value(101L))
+                .putPayload("pageNumber", io.qdrant.client.ValueFactory.value(3))
+                .putPayload("chunkIndex", io.qdrant.client.ValueFactory.value(1))
+                .putPayload("ownerId", io.qdrant.client.ValueFactory.value(42L))
+                .build();
+
+        when(mockAdapter.search(any())).thenReturn(List.of(point));
+
+        List<ScoredChunkDto> results = service.search(valid768Vector, 5, 42L);
+
+        ArgumentCaptor<io.qdrant.client.grpc.Points.SearchPoints> captor =
+                ArgumentCaptor.forClass(io.qdrant.client.grpc.Points.SearchPoints.class);
+        verify(mockAdapter).search(captor.capture());
+
+        io.qdrant.client.grpc.Points.SearchPoints searchPoints = captor.getValue();
+        assertThat(searchPoints.getCollectionName()).isEqualTo(TEST_COLLECTION);
+        assertThat(searchPoints.getLimit()).isEqualTo(5);
+        assertThat(searchPoints.getWithPayload().getEnable()).isTrue();
+        assertThat(searchPoints.getWithVectors().getEnable()).isFalse();
+        assertThat(searchPoints.hasFilter()).isTrue();
+
+        assertThat(results).hasSize(1);
+        ScoredChunkDto match = results.get(0);
+        assertThat(match.chunkId()).isEqualTo(101L);
+        assertThat(match.documentId()).isEqualTo(201L);
+        assertThat(match.pageNumber()).isEqualTo(3);
+        assertThat(match.chunkIndex()).isEqualTo(1);
+        assertThat(match.ownerId()).isEqualTo(42L);
+        assertThat(match.score()).isEqualTo(0.92f);
+    }
+
+    @Test
+    @DisplayName("search omits ownerId filter when ownerId is null (ADMIN query)")
+    void searchWithoutOwnerIdFilter() throws Exception {
+        QdrantVectorStoreService service = new QdrantVectorStoreService(
+                "localhost", 6333, 6334, TEST_COLLECTION, TEST_DIMENSIONS, false, "", mockAdapter);
+
+        when(mockAdapter.search(any())).thenReturn(Collections.emptyList());
+
+        List<ScoredChunkDto> results = service.search(valid768Vector, 10, null);
+
+        ArgumentCaptor<io.qdrant.client.grpc.Points.SearchPoints> captor =
+                ArgumentCaptor.forClass(io.qdrant.client.grpc.Points.SearchPoints.class);
+        verify(mockAdapter).search(captor.capture());
+
+        io.qdrant.client.grpc.Points.SearchPoints searchPoints = captor.getValue();
+        assertThat(searchPoints.hasFilter()).isFalse();
+        assertThat(results).isEmpty();
+    }
 }

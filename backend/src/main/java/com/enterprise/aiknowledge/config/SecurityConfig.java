@@ -86,6 +86,7 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/api/users/**").authenticated()     // Get user by ID
                 .requestMatchers("/api/auth/me").authenticated()                      // Current user info
                 .requestMatchers("/api/documents/**").authenticated()                 // Document management
+                .requestMatchers(HttpMethod.POST, "/api/search").authenticated()      // Semantic search
 
                 // Everything else also requires authentication (safe default)
                 .anyRequest().authenticated()

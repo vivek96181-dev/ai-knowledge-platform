@@ -91,6 +91,12 @@ qdrant:
   use-tls: ${QDRANT_USE_TLS:false}
   api-key: ${QDRANT_API_KEY:}
 
+# Semantic Search configuration
+search:
+  default-top-k: ${SEARCH_DEFAULT_TOP_K:5}
+  max-top-k: ${SEARCH_MAX_TOP_K:20}
+
+
 
 
 
