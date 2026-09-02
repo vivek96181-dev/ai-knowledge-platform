@@ -105,6 +105,13 @@
             <version>3.0.3</version>
         </dependency>
 
+        <!-- Google GenAI SDK: Official client for Gemini models and embeddings -->
+        <dependency>
+            <groupId>com.google.genai</groupId>
+            <artifactId>google-genai</artifactId>
+            <version>1.69.0</version>
+        </dependency>
+
         <!-- Spring Boot Starter Test: JUnit 5, Mockito, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

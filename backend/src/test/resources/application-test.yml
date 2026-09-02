@@ -57,5 +57,15 @@ chunking:
   target-size: 800
   overlap-size: 150
 
+gemini:
+  api-key: test-mock-api-key
+  embedding:
+    model: gemini-embedding-2
+    dimensions: 768
+    batch-size: 10
+    max-retries: 3
+    retry-delay-ms: 100
+
+
 
 
