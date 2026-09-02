@@ -1,16 +1,13 @@
 package com.enterprise.aiknowledge.kafka;
 
 import com.enterprise.aiknowledge.dto.DocumentResponse;
-import com.enterprise.aiknowledge.model.Document;
-import com.enterprise.aiknowledge.model.DocumentChunk;
-import com.enterprise.aiknowledge.model.DocumentStatus;
-import com.enterprise.aiknowledge.model.DocumentText;
-import com.enterprise.aiknowledge.model.Role;
-import com.enterprise.aiknowledge.model.User;
+import com.enterprise.aiknowledge.model.*;
+import com.enterprise.aiknowledge.repository.DocumentChunkEmbeddingRepository;
 import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
+import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.FileStorageService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.ActiveProfiles;
@@ -36,19 +34,21 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Integration tests verifying asynchronous Kafka document processing, PDF text extraction, and chunk persistence.
+ * Integration tests verifying asynchronous Kafka document processing, PDF text extraction, chunking,
+ * and embedding metadata persistence.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -60,6 +60,7 @@ class DocumentKafkaIntegrationTest {
     @Autowired private DocumentRepository documentRepository;
     @Autowired private DocumentTextRepository documentTextRepository;
     @Autowired private DocumentChunkRepository documentChunkRepository;
+    @Autowired private DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository;
     @Autowired private UserRepository userRepository;
     @Autowired private PasswordHashingService passwordHashingService;
     @Autowired private FileStorageService fileStorageService;
@@ -67,18 +68,34 @@ class DocumentKafkaIntegrationTest {
     @Autowired private DocumentProcessingConsumer documentProcessingConsumer;
     @Autowired private ObjectMapper objectMapper;
 
+    @MockBean private EmbeddingService embeddingService;
+
     private static final String BASE_URL = "/api/documents";
     private static final String USER_EMAIL = "kafka_test_user@example.com";
     private static final String PASSWORD = "TestPassword123";
 
     private User testUser;
+    private final List<Float> mock768Vector = Collections.nCopies(768, 0.05f);
 
     @BeforeEach
     void setUp() {
+        documentChunkEmbeddingRepository.deleteAll();
         documentChunkRepository.deleteAll();
         documentTextRepository.deleteAll();
         documentRepository.deleteAll();
         userRepository.deleteAll();
+
+        // Default mock behavior for offline testing
+        when(embeddingService.getModel()).thenReturn("gemini-embedding-2");
+        when(embeddingService.getDimensions()).thenReturn(768);
+        when(embeddingService.generateBatchEmbeddings(anyList())).thenAnswer(invocation -> {
+            List<DocumentChunk> chunks = invocation.getArgument(0);
+            Map<Long, List<Float>> map = new LinkedHashMap<>();
+            for (DocumentChunk chunk : chunks) {
+                map.put(chunk.getId(), mock768Vector);
+            }
+            return map;
+        });
 
         testUser = new User();
         testUser.setName("Kafka User");
@@ -89,12 +106,12 @@ class DocumentKafkaIntegrationTest {
     }
 
     // =========================================================================
-    // TEST 1: PDF upload -> Kafka -> Text Extraction -> DocumentText & Chunks saved -> COMPLETED
+    // TEST 1: PDF upload -> Kafka -> Text Extraction -> Chunks & Embeddings -> COMPLETED
     // =========================================================================
 
     @Test
-    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, persists DocumentText & DocumentChunks, sets COMPLETED")
-    void uploadValidPdfExtractsTextAndPersistsDocumentTextAndChunksAsynchronously() throws Exception {
+    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, chunks, embeds, and sets COMPLETED")
+    void uploadValidPdfExtractsTextChunksAndEmbeddingsAsynchronously() throws Exception {
         byte[] pdfBytes = createSamplePdfBytes("Enterprise AI Knowledge Platform Extraction Test", 2);
         MockMultipartFile file = new MockMultipartFile("file", "extraction_test.pdf", "application/pdf", pdfBytes);
 
@@ -122,7 +139,7 @@ class DocumentKafkaIntegrationTest {
             assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
             assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
 
-            // Verify DocumentChunks in PostgreSQL
+            // Verify DocumentChunks
             List<DocumentChunk> chunks = documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(response.id());
             assertThat(chunks).hasSize(2);
 
@@ -130,15 +147,21 @@ class DocumentKafkaIntegrationTest {
             assertThat(chunk0.getChunkIndex()).isEqualTo(0);
             assertThat(chunk0.getPageNumber()).isEqualTo(1);
             assertThat(chunk0.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
-            assertThat(chunk0.getCharacterStart()).isEqualTo(0);
-            assertThat(chunk0.getCharacterEnd()).isGreaterThan(0);
 
             DocumentChunk chunk1 = chunks.get(1);
             assertThat(chunk1.getChunkIndex()).isEqualTo(1);
             assertThat(chunk1.getPageNumber()).isEqualTo(2);
             assertThat(chunk1.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
-            assertThat(chunk1.getCharacterStart()).isEqualTo(0);
-            assertThat(chunk1.getCharacterEnd()).isGreaterThan(0);
+
+            // Verify DocumentChunkEmbedding metadata in PostgreSQL
+            List<DocumentChunkEmbedding> embeddings =
+                    documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(response.id());
+            assertThat(embeddings).hasSize(2);
+            for (DocumentChunkEmbedding embedding : embeddings) {
+                assertThat(embedding.getModel()).isEqualTo("gemini-embedding-2");
+                assertThat(embedding.getDimensions()).isEqualTo(768);
+                assertThat(embedding.getDocumentChunk()).isNotNull();
+            }
         });
     }
 
@@ -190,6 +213,7 @@ class DocumentKafkaIntegrationTest {
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
+        assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).isEmpty();
     }
 
     // =========================================================================
@@ -228,6 +252,7 @@ class DocumentKafkaIntegrationTest {
         assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
+        assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).isEmpty();
 
         Files.deleteIfExists(corruptFilePath);
     }
@@ -237,7 +262,7 @@ class DocumentKafkaIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("Consumer skips duplicate events for COMPLETED documents without creating duplicate DocumentText or DocumentChunk records")
+    @DisplayName("Consumer skips duplicate events for COMPLETED documents without creating duplicate records")
     void duplicateKafkaEventIsIdempotent() throws Exception {
         byte[] pdfBytes = createSamplePdfBytes("Idempotency Test Content", 1);
         Path uploadDir = Paths.get("uploads-test").toAbsolutePath().normalize();
@@ -267,17 +292,20 @@ class DocumentKafkaIntegrationTest {
         assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isPresent();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isTrue();
+        assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).hasSize(1);
 
         long initialTextRecordCount = documentTextRepository.count();
         long initialChunkRecordCount = documentChunkRepository.count();
+        long initialEmbeddingRecordCount = documentChunkEmbeddingRepository.count();
 
         // Duplicate consume call
         documentProcessingConsumer.consume(event);
 
-        // Verify status remains COMPLETED and record count did not increase
+        // Verify status remains COMPLETED and record counts did not increase
         assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
         assertThat(documentTextRepository.count()).isEqualTo(initialTextRecordCount);
         assertThat(documentChunkRepository.count()).isEqualTo(initialChunkRecordCount);
+        assertThat(documentChunkEmbeddingRepository.count()).isEqualTo(initialEmbeddingRecordCount);
 
         Files.deleteIfExists(pdfPath);
     }

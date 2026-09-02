@@ -1,13 +1,12 @@
 package com.enterprise.aiknowledge.kafka;
 
-import com.enterprise.aiknowledge.model.Document;
-import com.enterprise.aiknowledge.model.DocumentChunk;
-import com.enterprise.aiknowledge.model.DocumentStatus;
-import com.enterprise.aiknowledge.model.DocumentText;
+import com.enterprise.aiknowledge.model.*;
+import com.enterprise.aiknowledge.repository.DocumentChunkEmbeddingRepository;
 import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.service.ChunkingService;
+import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.FileStorageService;
 import com.enterprise.aiknowledge.service.PdfExtractionResult;
 import com.enterprise.aiknowledge.service.PdfTextExtractionService;
@@ -19,24 +18,28 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
  * Consumer component that receives {@link DocumentUploadedEvent} from Kafka,
  * extracts text via Apache PDFBox, persists the {@link DocumentText} entity,
- * chunks the text via {@link ChunkingService}, and persists {@link DocumentChunk} entities in PostgreSQL.
+ * chunks the text via {@link ChunkingService}, persists {@link DocumentChunk} entities,
+ * generates vector embeddings via {@link EmbeddingService} (Gemini Embedding 2),
+ * and persists {@link DocumentChunkEmbedding} metadata in PostgreSQL.
  *
  * <p><strong>Status Transitions:</strong>
  * <ul>
- *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code COMPLETED} (on successful text extraction & chunking)</li>
- *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code FAILED} (if file missing, unreadable, corrupt, or processing error)</li>
+ *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code COMPLETED} (on successful text extraction, chunking & embedding)</li>
+ *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code FAILED} (if any phase fails)</li>
  * </ul>
  * </p>
  *
  * <p><strong>Idempotency Strategy:</strong><br>
- * If a duplicate event arrives for a document that is already {@code COMPLETED} with extracted text and chunks present,
- * processing is skipped immediately. If reprocessing is triggered, existing chunks are cleanly cleared first.</p>
+ * If a duplicate event arrives for a document that is already {@code COMPLETED} with text, chunks, and matching embeddings,
+ * processing is skipped immediately. If reprocessing is triggered, old embeddings and chunks are cleanly cleared first.</p>
  */
 @Component
 public class DocumentProcessingConsumer {
@@ -46,23 +49,29 @@ public class DocumentProcessingConsumer {
     private final DocumentRepository documentRepository;
     private final DocumentTextRepository documentTextRepository;
     private final DocumentChunkRepository documentChunkRepository;
+    private final DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository;
     private final FileStorageService fileStorageService;
     private final PdfTextExtractionService pdfTextExtractionService;
     private final ChunkingService chunkingService;
+    private final EmbeddingService embeddingService;
 
     public DocumentProcessingConsumer(
             DocumentRepository documentRepository,
             DocumentTextRepository documentTextRepository,
             DocumentChunkRepository documentChunkRepository,
+            DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository,
             FileStorageService fileStorageService,
             PdfTextExtractionService pdfTextExtractionService,
-            ChunkingService chunkingService) {
+            ChunkingService chunkingService,
+            EmbeddingService embeddingService) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
+        this.documentChunkEmbeddingRepository = documentChunkEmbeddingRepository;
         this.fileStorageService = fileStorageService;
         this.pdfTextExtractionService = pdfTextExtractionService;
         this.chunkingService = chunkingService;
+        this.embeddingService = embeddingService;
     }
 
     @KafkaListener(
@@ -83,12 +92,26 @@ public class DocumentProcessingConsumer {
 
         Document document = documentOpt.get();
 
-        // Step 2: Idempotency check — skip if COMPLETED and both DocumentText and Chunks already exist
+        // Step 2: Idempotency check — skip if COMPLETED and text, chunks, and embeddings already exist
         if (document.getStatus() == DocumentStatus.COMPLETED &&
                 documentTextRepository.findByDocumentId(document.getId()).isPresent() &&
                 documentChunkRepository.existsByDocumentId(document.getId())) {
-            log.info("Document ID: {} is already COMPLETED with text and chunks present. Skipping duplicate event.", document.getId());
-            return;
+            List<DocumentChunkEmbedding> existingEmbeddings =
+                    documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(document.getId());
+            long totalChunks = documentChunkRepository.countByDocumentId(document.getId());
+
+            // Check if all chunks have embeddings with matching model & dimensions
+            boolean allEmbeddedWithSameConfig = totalChunks > 0 &&
+                    existingEmbeddings.size() == totalChunks &&
+                    existingEmbeddings.stream().allMatch(e ->
+                            e.getModel().equals(embeddingService.getModel()) &&
+                            e.getDimensions() == embeddingService.getDimensions());
+
+            if (allEmbeddedWithSameConfig) {
+                log.info("Document ID: {} is already COMPLETED with chunks and embeddings matching current model ({}) and dimensions ({}). Skipping duplicate event.",
+                        document.getId(), embeddingService.getModel(), embeddingService.getDimensions());
+                return;
+            }
         }
 
         try {
@@ -120,25 +143,48 @@ public class DocumentProcessingConsumer {
             documentText.setPageCount(extractionResult.pageCount());
             documentTextRepository.save(documentText);
 
-            // Step 7: Clear old chunks if any (safe for reprocessing) and generate new chunks
+            // Step 7: Clear old embeddings and chunks if reprocessing
+            documentChunkEmbeddingRepository.deleteByDocumentChunkDocumentId(document.getId());
             documentChunkRepository.deleteByDocumentId(document.getId());
 
             List<DocumentChunk> chunks = chunkingService.chunkDocument(document, extractionResult.pages());
             if (!chunks.isEmpty()) {
-                documentChunkRepository.saveAll(chunks);
+                chunks = documentChunkRepository.saveAll(chunks);
                 log.info("Saved {} chunks for document ID: {}", chunks.size(), document.getId());
+
+                // Step 8: Generate vector embeddings for all chunks via EmbeddingService
+                log.info("Generating embeddings for {} chunks of document ID: {} using model: {}",
+                        chunks.size(), document.getId(), embeddingService.getModel());
+                Map<Long, List<Float>> vectorMap = embeddingService.generateBatchEmbeddings(chunks);
+
+                List<DocumentChunkEmbedding> embeddingsToSave = new ArrayList<>();
+                for (DocumentChunk chunk : chunks) {
+                    List<Float> vector = vectorMap.get(chunk.getId());
+                    if (vector == null) {
+                        throw new IllegalStateException("Missing embedding vector for chunk ID: " + chunk.getId());
+                    }
+                    embeddingsToSave.add(new DocumentChunkEmbedding(
+                            chunk,
+                            embeddingService.getModel(),
+                            embeddingService.getDimensions()
+                    ));
+                }
+
+                documentChunkEmbeddingRepository.saveAll(embeddingsToSave);
+                log.info("Saved {} embedding metadata records for document ID: {}",
+                        embeddingsToSave.size(), document.getId());
             } else {
                 log.warn("Document ID: {} has no extractable text chunks", document.getId());
             }
 
-            // Step 8: Update document status to COMPLETED
+            // Step 9: Update document status to COMPLETED
             log.info("Successfully processed document ID: {} (pages: {}, chunks: {}). Status -> COMPLETED",
                     document.getId(), extractionResult.pageCount(), chunks.size());
             document.setStatus(DocumentStatus.COMPLETED);
             documentRepository.save(document);
 
         } catch (Exception ex) {
-            log.error("Failed to process document text extraction and chunking for document ID: {}", document.getId(), ex);
+            log.error("Failed to process document text extraction, chunking, or embedding for document ID: {}", document.getId(), ex);
             document.setStatus(DocumentStatus.FAILED);
             documentRepository.save(document);
         }

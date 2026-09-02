@@ -185,20 +185,24 @@ com.enterprise.aiknowledge
 │
 ├── kafka
 │   ├── DocumentEventProducer.java
-│   ├── DocumentProcessingConsumer.java   ← Extracted text worker + state machine
+│   ├── DocumentProcessingConsumer.java   ← Text extraction, chunking & embedding worker
 │   ├── DocumentUploadedEvent.java
 │   └── KafkaTopicConfig.java
 │
 ├── model
 │   ├── Document.java                     ← Metadata table ("documents")
+│   ├── DocumentChunk.java                ← Chunks table ("document_chunks")
+│   ├── DocumentChunkEmbedding.java       ← Embedding metadata table ("document_chunk_embeddings")
 │   ├── DocumentStatus.java               ← UPLOADED | PROCESSING | COMPLETED | FAILED
 │   ├── DocumentText.java                 ← Extracted text table ("document_texts")
 │   ├── Role.java
 │   └── User.java
 │
 ├── repository
+│   ├── DocumentChunkEmbeddingRepository.java ← Embedding metadata queries & lifecycle
+│   ├── DocumentChunkRepository.java          ← Chunk queries & lifecycle
 │   ├── DocumentRepository.java
-│   ├── DocumentTextRepository.java       ← Extracted text repository queries
+│   ├── DocumentTextRepository.java           ← Extracted text repository queries
 │   └── UserRepository.java
 │
 ├── security
@@ -209,11 +213,54 @@ com.enterprise.aiknowledge
 │
 └── service
     ├── AuthService.java
-    ├── DocumentService.java
+    ├── ChunkingService.java              ← Deterministic chunking engine
+    ├── DocumentService.java              ← Upload/CRUD + cascading cleanup
+    ├── EmbeddingService.java             ← Vector embedding interface
     ├── FileStorageService.java
+    ├── GeminiEmbeddingService.java       ← Google GenAI SDK (Gemini Embedding 2)
     ├── LocalFileStorageService.java
+    ├── PageText.java                     ← Page number + page text record
     ├── PasswordHashingService.java
-    ├── PdfExtractionResult.java          ← Text + page count DTO
+    ├── PdfExtractionResult.java          ← Text + page count + PageText list DTO
     ├── PdfTextExtractionService.java     ← Apache PDFBox extraction engine
     └── UserService.java
 ```
+
+---
+
+## Embedding Generation Architecture (`feature/embedding-generation`)
+
+### 1. Ingestion Pipeline
+```
+DocumentChunk (PostgreSQL)
+       │
+       ▼
+EmbeddingService (GeminiEmbeddingService)
+       │
+       ▼ [Google Gen AI SDK / gemini-embedding-2]
+Embedding Vector (768 dimensions)
+       │
+       ▼
+DocumentChunkEmbedding (PostgreSQL metadata: model, dimensions, timestamps)
+       │
+       ▼ [Future Phase]
+Qdrant Vector Database (Vector indexing & hybrid search)
+```
+
+### 2. Architecture & Design Rationale
+
+| Question | Architectural Rationale |
+| :--- | :--- |
+| **Why embeddings are needed?** | Traditional keyword search matches exact tokens but fails on semantic concepts (e.g. searching *"automobile upkeep"* misses *"car maintenance"*). Embeddings project text into a continuous geometric vector space where semantically similar meanings cluster together. |
+| **Why one vector per chunk?** | Slicing documents into ~800-character chunks preserves granular concepts. An embedding of a 100-page document compresses too much meaning into one point (semantic dilution), while chunk embeddings allow pinpoint retrieval. |
+| **Why 768 dimensions?** | 768 dimensions strike an optimal balance between expressive semantic representation, storage efficiency, and search latency. Supported natively by `gemini-embedding-2` via `outputDimensionality`. |
+| **Why is the model configurable?** | Decoupling the model (`gemini.embedding.model`) and dimensions (`gemini.embedding.dimensions`) via `application.yml` allows seamless upgrades (e.g. to future Gemini versions or local models) without modifying ingestion code. |
+| **Why is embedding generation asynchronous?** | Generating embeddings requires remote network calls that take 100ms–1000ms. Running this inside the background Kafka consumer (`DocumentProcessingConsumer`) guarantees the upload HTTP API (`POST /api/documents`) remains blazing fast (~20ms). |
+| **Why are vectors not stored in PostgreSQL?** | High-dimensional float vectors consume gigabytes of table storage, degrade relational cache efficiency, and cause row bloat. PostgreSQL stores lightweight metadata (`DocumentChunkEmbedding`), while Qdrant is optimized specifically for vector indexing (HNSW graphs). |
+| **Why Qdrant will store vectors later?** | Specialized vector databases like Qdrant provide Approximate Nearest Neighbor (ANN) search with sub-millisecond latency and hardware-accelerated distance metrics (Cosine, Dot product). |
+| **Why incompatible models cannot be mixed?** | Vectors from different models (or even different dimensions of the same model) exist in entirely different geometric coordinate spaces. Calculating cosine similarity between a vector from Model A and Model B yields meaningless mathematical garbage. |
+| **Free-Tier & Zero-Cost Guarantee** | Uses the Gemini Developer API free tier. Automated test suites run 100% offline using mocks and Embedded Kafka, requiring ₹0 and no API key. |
+| **Data Privacy Policy** | Only the plain text of individual `DocumentChunk` records is transmitted to the Gemini Embedding API. Passwords, JWTs, user profiles, and database credentials are never transmitted or logged. |
+| **Bounded Retry Strategy** | Transient errors (HTTP 429 rate limits, 503 unavailable, network timeouts) are retried with exponential backoff up to `gemini.embedding.max-retries` (default 3). Permanent errors (400 Bad Request, 401 Unauthorized, dimension mismatches) fail immediately without retrying. |
+| **Re-Embedding Strategy** | When changing models or dimensions, existing embeddings must not be silently overwritten. Instead, the collection must be re-indexed cleanly (`deleteByDocumentChunkDocumentId`), preventing incompatible vector spaces from polluting the index. |
+

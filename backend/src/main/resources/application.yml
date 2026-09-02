@@ -71,5 +71,16 @@ chunking:
   target-size: ${CHUNKING_TARGET_SIZE:800}
   overlap-size: ${CHUNKING_OVERLAP_SIZE:150}
 
+# Gemini Embedding configuration
+gemini:
+  api-key: ${GEMINI_API_KEY:}
+  embedding:
+    model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-2}
+    dimensions: ${GEMINI_EMBEDDING_DIMENSIONS:768}
+    batch-size: ${GEMINI_EMBEDDING_BATCH_SIZE:10}
+    max-retries: ${GEMINI_EMBEDDING_MAX_RETRIES:3}
+    retry-delay-ms: ${GEMINI_EMBEDDING_RETRY_DELAY_MS:500}
+
+
 
 
