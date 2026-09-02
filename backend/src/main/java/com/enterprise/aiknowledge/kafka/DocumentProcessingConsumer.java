@@ -5,11 +5,13 @@ import com.enterprise.aiknowledge.repository.DocumentChunkEmbeddingRepository;
 import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
+import com.enterprise.aiknowledge.service.ChunkVectorDto;
 import com.enterprise.aiknowledge.service.ChunkingService;
 import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.FileStorageService;
 import com.enterprise.aiknowledge.service.PdfExtractionResult;
 import com.enterprise.aiknowledge.service.PdfTextExtractionService;
+import com.enterprise.aiknowledge.service.VectorStoreService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -28,18 +30,19 @@ import java.util.Optional;
  * extracts text via Apache PDFBox, persists the {@link DocumentText} entity,
  * chunks the text via {@link ChunkingService}, persists {@link DocumentChunk} entities,
  * generates vector embeddings via {@link EmbeddingService} (Gemini Embedding 2),
- * and persists {@link DocumentChunkEmbedding} metadata in PostgreSQL.
+ * persists {@link DocumentChunkEmbedding} metadata in PostgreSQL,
+ * and upserts high-dimensional vector points into the Qdrant vector database.
  *
  * <p><strong>Status Transitions:</strong>
  * <ul>
- *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code COMPLETED} (on successful text extraction, chunking & embedding)</li>
- *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code FAILED} (if any phase fails)</li>
+ *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code COMPLETED} (on successful text extraction, chunking, embedding & vector indexing)</li>
+ *   <li>{@code UPLOADED} → {@code PROCESSING} → {@code FAILED} (if any phase, including Qdrant indexing, fails)</li>
  * </ul>
  * </p>
  *
  * <p><strong>Idempotency Strategy:</strong><br>
  * If a duplicate event arrives for a document that is already {@code COMPLETED} with text, chunks, and matching embeddings,
- * processing is skipped immediately. If reprocessing is triggered, old embeddings and chunks are cleanly cleared first.</p>
+ * processing is skipped immediately. If reprocessing is triggered, old Qdrant vectors, embeddings, and chunks are cleanly cleared first.</p>
  */
 @Component
 public class DocumentProcessingConsumer {
@@ -54,6 +57,7 @@ public class DocumentProcessingConsumer {
     private final PdfTextExtractionService pdfTextExtractionService;
     private final ChunkingService chunkingService;
     private final EmbeddingService embeddingService;
+    private final VectorStoreService vectorStoreService;
 
     public DocumentProcessingConsumer(
             DocumentRepository documentRepository,
@@ -63,7 +67,8 @@ public class DocumentProcessingConsumer {
             FileStorageService fileStorageService,
             PdfTextExtractionService pdfTextExtractionService,
             ChunkingService chunkingService,
-            EmbeddingService embeddingService) {
+            EmbeddingService embeddingService,
+            VectorStoreService vectorStoreService) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -72,6 +77,7 @@ public class DocumentProcessingConsumer {
         this.pdfTextExtractionService = pdfTextExtractionService;
         this.chunkingService = chunkingService;
         this.embeddingService = embeddingService;
+        this.vectorStoreService = vectorStoreService;
     }
 
     @KafkaListener(
@@ -143,7 +149,8 @@ public class DocumentProcessingConsumer {
             documentText.setPageCount(extractionResult.pageCount());
             documentTextRepository.save(documentText);
 
-            // Step 7: Clear old embeddings and chunks if reprocessing
+            // Step 7: Clear old Qdrant vectors, embeddings, and chunks if reprocessing
+            vectorStoreService.deleteVectorsByDocumentId(document.getId());
             documentChunkEmbeddingRepository.deleteByDocumentChunkDocumentId(document.getId());
             documentChunkRepository.deleteByDocumentId(document.getId());
 
@@ -158,6 +165,9 @@ public class DocumentProcessingConsumer {
                 Map<Long, List<Float>> vectorMap = embeddingService.generateBatchEmbeddings(chunks);
 
                 List<DocumentChunkEmbedding> embeddingsToSave = new ArrayList<>();
+                List<ChunkVectorDto> chunkVectorsToIndex = new ArrayList<>();
+                Long ownerId = document.getOwner() != null ? document.getOwner().getId() : null;
+
                 for (DocumentChunk chunk : chunks) {
                     List<Float> vector = vectorMap.get(chunk.getId());
                     if (vector == null) {
@@ -168,23 +178,39 @@ public class DocumentProcessingConsumer {
                             embeddingService.getModel(),
                             embeddingService.getDimensions()
                     ));
+                    chunkVectorsToIndex.add(new ChunkVectorDto(
+                            chunk.getId(),
+                            document.getId(),
+                            chunk.getPageNumber(),
+                            chunk.getChunkIndex(),
+                            ownerId,
+                            vector
+                    ));
                 }
 
+                // Persist embedding metadata in PostgreSQL
                 documentChunkEmbeddingRepository.saveAll(embeddingsToSave);
-                log.info("Saved {} embedding metadata records for document ID: {}",
+                log.info("Saved {} embedding metadata records in PostgreSQL for document ID: {}",
                         embeddingsToSave.size(), document.getId());
+
+                // Step 9: Upsert vector points with payload into Qdrant
+                log.info("Upserting {} vector points into Qdrant collection '{}' for document ID: {}",
+                        chunkVectorsToIndex.size(), vectorStoreService.getCollectionName(), document.getId());
+                vectorStoreService.upsertChunkVectors(chunkVectorsToIndex);
+                log.info("Successfully indexed all vectors in Qdrant for document ID: {}", document.getId());
             } else {
                 log.warn("Document ID: {} has no extractable text chunks", document.getId());
             }
 
-            // Step 9: Update document status to COMPLETED
+            // Step 10: Update document status to COMPLETED
             log.info("Successfully processed document ID: {} (pages: {}, chunks: {}). Status -> COMPLETED",
                     document.getId(), extractionResult.pageCount(), chunks.size());
             document.setStatus(DocumentStatus.COMPLETED);
             documentRepository.save(document);
 
         } catch (Exception ex) {
-            log.error("Failed to process document text extraction, chunking, or embedding for document ID: {}", document.getId(), ex);
+            log.error("Failed to process document text extraction, chunking, embedding, or Qdrant indexing for document ID: {}",
+                    document.getId(), ex);
             document.setStatus(DocumentStatus.FAILED);
             documentRepository.save(document);
         }

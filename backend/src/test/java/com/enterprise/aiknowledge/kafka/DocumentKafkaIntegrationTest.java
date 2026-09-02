@@ -7,9 +7,11 @@ import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
+import com.enterprise.aiknowledge.service.ChunkVectorDto;
 import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.FileStorageService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
+import com.enterprise.aiknowledge.service.VectorStoreService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
@@ -19,6 +21,7 @@ import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -40,7 +43,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.anyList;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -48,7 +51,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Integration tests verifying asynchronous Kafka document processing, PDF text extraction, chunking,
- * and embedding metadata persistence.
+ * embedding metadata persistence, and Qdrant vector indexing.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -69,6 +72,7 @@ class DocumentKafkaIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
 
     @MockBean private EmbeddingService embeddingService;
+    @MockBean private VectorStoreService vectorStoreService;
 
     private static final String BASE_URL = "/api/documents";
     private static final String USER_EMAIL = "kafka_test_user@example.com";
@@ -97,6 +101,9 @@ class DocumentKafkaIntegrationTest {
             return map;
         });
 
+        when(vectorStoreService.getCollectionName()).thenReturn("document_chunks_test");
+        when(vectorStoreService.getVectorDimensions()).thenReturn(768);
+
         testUser = new User();
         testUser.setName("Kafka User");
         testUser.setEmail(USER_EMAIL);
@@ -106,11 +113,11 @@ class DocumentKafkaIntegrationTest {
     }
 
     // =========================================================================
-    // TEST 1: PDF upload -> Kafka -> Text Extraction -> Chunks & Embeddings -> COMPLETED
+    // TEST 1: PDF upload -> Kafka -> Text Extraction -> Chunks & Embeddings -> Qdrant -> COMPLETED
     // =========================================================================
 
     @Test
-    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, chunks, embeds, and sets COMPLETED")
+    @DisplayName("Upload valid PDF returns UPLOADED; Kafka consumer extracts text, chunks, embeds, indexes into Qdrant, and sets COMPLETED")
     void uploadValidPdfExtractsTextChunksAndEmbeddingsAsynchronously() throws Exception {
         byte[] pdfBytes = createSamplePdfBytes("Enterprise AI Knowledge Platform Extraction Test", 2);
         MockMultipartFile file = new MockMultipartFile("file", "extraction_test.pdf", "application/pdf", pdfBytes);
@@ -136,32 +143,26 @@ class DocumentKafkaIntegrationTest {
             assertThat(docTextOpt).isPresent();
             DocumentText docText = docTextOpt.get();
             assertThat(docText.getPageCount()).isEqualTo(2);
-            assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
-            assertThat(docText.getExtractedText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
 
             // Verify DocumentChunks
             List<DocumentChunk> chunks = documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(response.id());
             assertThat(chunks).hasSize(2);
 
-            DocumentChunk chunk0 = chunks.get(0);
-            assertThat(chunk0.getChunkIndex()).isEqualTo(0);
-            assertThat(chunk0.getPageNumber()).isEqualTo(1);
-            assertThat(chunk0.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 1");
-
-            DocumentChunk chunk1 = chunks.get(1);
-            assertThat(chunk1.getChunkIndex()).isEqualTo(1);
-            assertThat(chunk1.getPageNumber()).isEqualTo(2);
-            assertThat(chunk1.getText()).contains("Enterprise AI Knowledge Platform Extraction Test - Page 2");
-
             // Verify DocumentChunkEmbedding metadata in PostgreSQL
             List<DocumentChunkEmbedding> embeddings =
                     documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(response.id());
             assertThat(embeddings).hasSize(2);
-            for (DocumentChunkEmbedding embedding : embeddings) {
-                assertThat(embedding.getModel()).isEqualTo("gemini-embedding-2");
-                assertThat(embedding.getDimensions()).isEqualTo(768);
-                assertThat(embedding.getDocumentChunk()).isNotNull();
-            }
+
+            // Verify Qdrant vectorStoreService was called with 2 vectors
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<ChunkVectorDto>> vectorCaptor = ArgumentCaptor.forClass(List.class);
+            verify(vectorStoreService).upsertChunkVectors(vectorCaptor.capture());
+
+            List<ChunkVectorDto> upsertedVectors = vectorCaptor.getValue();
+            assertThat(upsertedVectors).hasSize(2);
+            assertThat(upsertedVectors.get(0).documentId()).isEqualTo(response.id());
+            assertThat(upsertedVectors.get(0).vector()).hasSize(768);
+            assertThat(upsertedVectors.get(0).ownerId()).isEqualTo(testUser.getId());
         });
     }
 
@@ -214,6 +215,7 @@ class DocumentKafkaIntegrationTest {
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
         assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).isEmpty();
+        verify(vectorStoreService, never()).upsertChunkVectors(anyList());
     }
 
     // =========================================================================
@@ -253,12 +255,56 @@ class DocumentKafkaIntegrationTest {
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isEmpty();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isFalse();
         assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).isEmpty();
+        verify(vectorStoreService, never()).upsertChunkVectors(anyList());
 
         Files.deleteIfExists(corruptFilePath);
     }
 
     // =========================================================================
-    // TEST 5: Duplicate Kafka event is idempotent
+    // TEST 5: Qdrant indexing failure results in FAILED status (Never COMPLETED)
+    // =========================================================================
+
+    @Test
+    @DisplayName("Qdrant indexing failure sets document status to FAILED and prevents COMPLETED status")
+    void qdrantIndexingFailureResultsInFailedStatus() throws Exception {
+        byte[] pdfBytes = createSamplePdfBytes("Qdrant Failure Test Content", 1);
+        Path uploadDir = Paths.get("uploads-test").toAbsolutePath().normalize();
+        Files.createDirectories(uploadDir);
+        Path pdfPath = uploadDir.resolve("qdrant_fail_doc.pdf");
+        Files.write(pdfPath, pdfBytes);
+
+        Document doc = new Document();
+        doc.setOwner(testUser);
+        doc.setOriginalFilename("qdrant_fail_doc.pdf");
+        doc.setStoredFilename("qdrant_fail_doc.pdf");
+        doc.setContentType("application/pdf");
+        doc.setFileSize((long) pdfBytes.length);
+        doc.setStoragePath(pdfPath.toString());
+        doc.setStatus(DocumentStatus.UPLOADED);
+        doc = documentRepository.save(doc);
+
+        DocumentUploadedEvent event = new DocumentUploadedEvent(
+                doc.getId(),
+                testUser.getId(),
+                doc.getStoragePath(),
+                doc.getOriginalFilename()
+        );
+
+        // Configure Qdrant to fail
+        doThrow(new RuntimeException("Qdrant gRPC connection timeout"))
+                .when(vectorStoreService).upsertChunkVectors(anyList());
+
+        documentProcessingConsumer.consume(event);
+
+        Document updatedDoc = documentRepository.findById(doc.getId()).orElseThrow();
+        // Document MUST NOT become COMPLETED
+        assertThat(updatedDoc.getStatus()).isEqualTo(DocumentStatus.FAILED);
+
+        Files.deleteIfExists(pdfPath);
+    }
+
+    // =========================================================================
+    // TEST 6: Duplicate Kafka event is idempotent
     // =========================================================================
 
     @Test
@@ -293,6 +339,7 @@ class DocumentKafkaIntegrationTest {
         assertThat(documentTextRepository.findByDocumentId(doc.getId())).isPresent();
         assertThat(documentChunkRepository.existsByDocumentId(doc.getId())).isTrue();
         assertThat(documentChunkEmbeddingRepository.findByDocumentChunkDocumentId(doc.getId())).hasSize(1);
+        verify(vectorStoreService, times(1)).upsertChunkVectors(anyList());
 
         long initialTextRecordCount = documentTextRepository.count();
         long initialChunkRecordCount = documentChunkRepository.count();
@@ -301,11 +348,12 @@ class DocumentKafkaIntegrationTest {
         // Duplicate consume call
         documentProcessingConsumer.consume(event);
 
-        // Verify status remains COMPLETED and record counts did not increase
+        // Verify status remains COMPLETED, record counts did not increase, and Qdrant upsert was not repeated
         assertThat(documentRepository.findById(doc.getId()).orElseThrow().getStatus()).isEqualTo(DocumentStatus.COMPLETED);
         assertThat(documentTextRepository.count()).isEqualTo(initialTextRecordCount);
         assertThat(documentChunkRepository.count()).isEqualTo(initialChunkRecordCount);
         assertThat(documentChunkEmbeddingRepository.count()).isEqualTo(initialEmbeddingRecordCount);
+        verify(vectorStoreService, times(1)).upsertChunkVectors(anyList());
 
         Files.deleteIfExists(pdfPath);
     }

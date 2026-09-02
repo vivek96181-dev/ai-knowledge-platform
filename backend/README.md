@@ -213,8 +213,9 @@ com.enterprise.aiknowledge
 │
 └── service
     ├── AuthService.java
+    ├── ChunkVectorDto.java               ← DTO for chunk vector & payload indexing
     ├── ChunkingService.java              ← Deterministic chunking engine
-    ├── DocumentService.java              ← Upload/CRUD + cascading cleanup
+    ├── DocumentService.java              ← Upload/CRUD + cascading cleanup (DB + Qdrant)
     ├── EmbeddingService.java             ← Vector embedding interface
     ├── FileStorageService.java
     ├── GeminiEmbeddingService.java       ← Google GenAI SDK (Gemini Embedding 2)
@@ -223,7 +224,9 @@ com.enterprise.aiknowledge
     ├── PasswordHashingService.java
     ├── PdfExtractionResult.java          ← Text + page count + PageText list DTO
     ├── PdfTextExtractionService.java     ← Apache PDFBox extraction engine
-    └── UserService.java
+    ├── QdrantVectorStoreService.java     ← Qdrant vector database service (gRPC)
+    ├── UserService.java
+    └── VectorStoreService.java           ← Vector store abstraction interface
 ```
 
 ---
@@ -243,7 +246,7 @@ Embedding Vector (768 dimensions)
        ▼
 DocumentChunkEmbedding (PostgreSQL metadata: model, dimensions, timestamps)
        │
-       ▼ [Future Phase]
+       ▼ [Current Phase: Qdrant Integration]
 Qdrant Vector Database (Vector indexing & hybrid search)
 ```
 
@@ -257,10 +260,81 @@ Qdrant Vector Database (Vector indexing & hybrid search)
 | **Why is the model configurable?** | Decoupling the model (`gemini.embedding.model`) and dimensions (`gemini.embedding.dimensions`) via `application.yml` allows seamless upgrades (e.g. to future Gemini versions or local models) without modifying ingestion code. |
 | **Why is embedding generation asynchronous?** | Generating embeddings requires remote network calls that take 100ms–1000ms. Running this inside the background Kafka consumer (`DocumentProcessingConsumer`) guarantees the upload HTTP API (`POST /api/documents`) remains blazing fast (~20ms). |
 | **Why are vectors not stored in PostgreSQL?** | High-dimensional float vectors consume gigabytes of table storage, degrade relational cache efficiency, and cause row bloat. PostgreSQL stores lightweight metadata (`DocumentChunkEmbedding`), while Qdrant is optimized specifically for vector indexing (HNSW graphs). |
-| **Why Qdrant will store vectors later?** | Specialized vector databases like Qdrant provide Approximate Nearest Neighbor (ANN) search with sub-millisecond latency and hardware-accelerated distance metrics (Cosine, Dot product). |
+| **Why Qdrant stores vectors?** | Specialized vector databases like Qdrant provide Approximate Nearest Neighbor (ANN) search with sub-millisecond latency and hardware-accelerated distance metrics (Cosine, Dot product). |
 | **Why incompatible models cannot be mixed?** | Vectors from different models (or even different dimensions of the same model) exist in entirely different geometric coordinate spaces. Calculating cosine similarity between a vector from Model A and Model B yields meaningless mathematical garbage. |
 | **Free-Tier & Zero-Cost Guarantee** | Uses the Gemini Developer API free tier. Automated test suites run 100% offline using mocks and Embedded Kafka, requiring ₹0 and no API key. |
 | **Data Privacy Policy** | Only the plain text of individual `DocumentChunk` records is transmitted to the Gemini Embedding API. Passwords, JWTs, user profiles, and database credentials are never transmitted or logged. |
 | **Bounded Retry Strategy** | Transient errors (HTTP 429 rate limits, 503 unavailable, network timeouts) are retried with exponential backoff up to `gemini.embedding.max-retries` (default 3). Permanent errors (400 Bad Request, 401 Unauthorized, dimension mismatches) fail immediately without retrying. |
 | **Re-Embedding Strategy** | When changing models or dimensions, existing embeddings must not be silently overwritten. Instead, the collection must be re-indexed cleanly (`deleteByDocumentChunkDocumentId`), preventing incompatible vector spaces from polluting the index. |
+
+---
+
+## Qdrant Vector Database Integration (`feature/qdrant-integration`)
+
+### 1. Vector Point Architecture
+```
+DocumentProcessingConsumer (@KafkaListener)
+       ├── ... (PDF text extraction -> DocumentText -> Chunking -> Embeddings)
+       ├── Save DocumentChunkEmbedding metadata in PostgreSQL
+       └── Upsert vector points to Qdrant (via VectorStoreService)
+                 │
+                 ▼ [Collection: document_chunks]
+                 Point {
+                   id: chunkId,                     ← Deterministic point ID (PointIdFactory.id(chunkId))
+                   vectors: [float x 768],          ← 768-dim float vector from Gemini Embedding 2
+                   payload: {
+                     "documentId": 123,             ← Foreign key to parent Document
+                     "documentChunkId": 456,        ← ID of DocumentChunk
+                     "pageNumber": 1,               ← Source page for citations
+                     "chunkIndex": 0,               ← Sequential chunk index within document
+                     "ownerId": 1                   ← Document owner ID (for future security filtering)
+                   }
+                 }
+```
+
+### 2. Configuration Parameters
+In `application.yml`:
+```yaml
+qdrant:
+  host: ${QDRANT_HOST:localhost}
+  port: ${QDRANT_PORT:6333}           # REST API
+  grpc-port: ${QDRANT_GRPC_PORT:6334} # High-performance gRPC API
+  collection-name: ${QDRANT_COLLECTION:document_chunks}
+  vector-dimensions: ${QDRANT_VECTOR_DIMENSIONS:768}
+  use-tls: ${QDRANT_USE_TLS:false}
+  api-key: ${QDRANT_API_KEY:}
+```
+
+### 3. Collection Management & Idempotency
+- **Creation:** On startup (`@PostConstruct`) and on demand, `QdrantVectorStoreService.ensureCollectionExists()` checks if the collection exists. If missing, it creates the collection with **768 dimensions** and **Cosine distance**.
+- **Compatibility Verification:** If the collection already exists, the service queries its parameters. If dimensions or distance metrics do not match (e.g. 512 vs 768 or Euclid vs Cosine), it throws an `IllegalStateException` preventing corrupted index queries.
+- **Deterministic Point IDs:** Points use `PointIdFactory.id(chunkId)` ensuring that re-upserting a chunk simply updates the point in place without creating duplicate points.
+- **Reprocessing & Deletion:**
+  - When a document is reprocessed, old points are purged via `deleteVectorsByDocumentId(documentId)` using a payload filter condition `ConditionFactory.match("documentId", documentId)`.
+  - When a document is deleted via `DELETE /api/documents/{id}`, its points are deleted from Qdrant prior to database entity removal.
+
+### 4. Running the Complete Infrastructure Locally
+To launch PostgreSQL, Kafka, and Qdrant together:
+```powershell
+# 1. Start all infrastructure services
+docker compose -f infrastructure/docker-compose.yml up -d
+
+# 2. Verify containers are healthy
+docker compose -f infrastructure/docker-compose.yml ps
+
+# 3. Check Qdrant readiness (REST: 6333, gRPC: 6334)
+curl http://localhost:6333/readyz
+
+# 4. Start Spring Boot backend
+cd backend
+.\mvnw.cmd spring-boot:run
+```
+
+### 5. Troubleshooting Qdrant Connections
+- **`Connection refused` / `io.grpc.StatusRuntimeException: UNAVAILABLE`**: Ensure the Qdrant container is running:
+  `docker compose -f infrastructure/docker-compose.yml ps`
+- **Check Qdrant Logs**:
+  `docker compose -f infrastructure/docker-compose.yml logs -f qdrant`
+- **Verify Web UI**: Visit `http://localhost:6333/dashboard` in a web browser to inspect collections and vector counts visually.
+
 

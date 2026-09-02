@@ -37,6 +37,7 @@ public class DocumentService {
     private final UserRepository userRepository;
     private final FileStorageService fileStorageService;
     private final DocumentEventProducer documentEventProducer;
+    private final VectorStoreService vectorStoreService;
 
     public DocumentService(
             DocumentRepository documentRepository,
@@ -45,7 +46,8 @@ public class DocumentService {
             com.enterprise.aiknowledge.repository.DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository,
             UserRepository userRepository,
             FileStorageService fileStorageService,
-            DocumentEventProducer documentEventProducer) {
+            DocumentEventProducer documentEventProducer,
+            VectorStoreService vectorStoreService) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -53,6 +55,7 @@ public class DocumentService {
         this.userRepository = userRepository;
         this.fileStorageService = fileStorageService;
         this.documentEventProducer = documentEventProducer;
+        this.vectorStoreService = vectorStoreService;
     }
 
     /**
@@ -189,6 +192,9 @@ public class DocumentService {
 
         // Delete physical file from storage
         fileStorageService.deleteFile(document.getStoragePath());
+
+        // Delete associated vector points from Qdrant
+        vectorStoreService.deleteVectorsByDocumentId(document.getId());
 
         // Delete associated embeddings first (grandchild records)
         documentChunkEmbeddingRepository.deleteByDocumentChunkDocumentId(document.getId());
