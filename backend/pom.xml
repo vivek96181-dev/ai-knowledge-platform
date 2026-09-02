@@ -112,6 +112,13 @@
             <version>1.69.0</version>
         </dependency>
 
+        <!-- Qdrant Java Client: High-performance vector database client (gRPC) -->
+        <dependency>
+            <groupId>io.qdrant</groupId>
+            <artifactId>client</artifactId>
+            <version>1.19.0</version>
+        </dependency>
+
         <!-- Spring Boot Starter Test: JUnit 5, Mockito, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

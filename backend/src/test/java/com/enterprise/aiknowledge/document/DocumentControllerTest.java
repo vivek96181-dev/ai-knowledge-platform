@@ -50,6 +50,9 @@ class DocumentControllerTest {
     @Autowired private LocalFileStorageService fileStorageService;
     @Autowired private ObjectMapper objectMapper;
 
+    @org.springframework.boot.test.mock.mockito.MockBean
+    private com.enterprise.aiknowledge.service.VectorStoreService vectorStoreService;
+
     private static final String BASE_URL = "/api/documents";
 
     private static final String USER1_EMAIL = "user1@example.com";

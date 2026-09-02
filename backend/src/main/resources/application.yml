@@ -81,6 +81,17 @@ gemini:
     max-retries: ${GEMINI_EMBEDDING_MAX_RETRIES:3}
     retry-delay-ms: ${GEMINI_EMBEDDING_RETRY_DELAY_MS:500}
 
+# Qdrant Vector Database configuration
+qdrant:
+  host: ${QDRANT_HOST:localhost}
+  port: ${QDRANT_PORT:6333}
+  grpc-port: ${QDRANT_GRPC_PORT:6334}
+  collection-name: ${QDRANT_COLLECTION:document_chunks}
+  vector-dimensions: ${QDRANT_VECTOR_DIMENSIONS:768}
+  use-tls: ${QDRANT_USE_TLS:false}
+  api-key: ${QDRANT_API_KEY:}
+
+
 
 
 

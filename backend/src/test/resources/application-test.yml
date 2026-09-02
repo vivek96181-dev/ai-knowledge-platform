@@ -66,6 +66,16 @@ gemini:
     max-retries: 3
     retry-delay-ms: 100
 
+qdrant:
+  host: localhost
+  port: 6333
+  grpc-port: 6334
+  collection-name: document_chunks_test
+  vector-dimensions: 768
+  use-tls: false
+  api-key: ""
+
+
 
 
 
