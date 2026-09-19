@@ -1,0 +1,84 @@
+{
+  "name": "rag-baseline-v1",
+  "version": "1.0.0",
+  "description": "Baseline evaluation dataset for enterprise RAG retrieval and answer generation quality.",
+  "cases": [
+    {
+      "id": "eval-leave-001",
+      "question": "What is the annual leave policy and how many days can be carried forward?",
+      "expectedChunkIds": [101, 102],
+      "expectedDocumentIds": [10],
+      "referenceAnswer": "Employees receive 20 days of annual leave per calendar year. Up to 5 unused days may be carried forward into the next year.",
+      "requiredConcepts": ["20 days", "annual leave", "5 unused days", "carried forward"],
+      "isUnanswerable": false,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-remote-002",
+      "question": "What equipment and home office stipend does the company provide for remote employees?",
+      "expectedChunkIds": [103, 104],
+      "expectedDocumentIds": [11],
+      "referenceAnswer": "Remote employees receive a company laptop, external monitor, and a one-time 500 dollar home office setup stipend.",
+      "requiredConcepts": ["laptop", "monitor", "500", "stipend"],
+      "isUnanswerable": false,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-probation-003",
+      "question": "How long is the employee probation period and how often are reviews conducted during it?",
+      "expectedChunkIds": [105],
+      "expectedDocumentIds": [12],
+      "referenceAnswer": "The standard employee probation period is 90 days with formal check-ins conducted every 30 days.",
+      "requiredConcepts": ["90 days", "probation", "30 days"],
+      "isUnanswerable": false,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-unans-004",
+      "question": "What is the street address of the company's regional branch office in Tokyo?",
+      "expectedChunkIds": [],
+      "expectedDocumentIds": [],
+      "referenceAnswer": "The requested information is not available in the provided documents.",
+      "requiredConcepts": ["not available"],
+      "isUnanswerable": true,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-unans-005",
+      "question": "What is the stock ticker symbol for the company's publicly traded shares?",
+      "expectedChunkIds": [],
+      "expectedDocumentIds": [],
+      "referenceAnswer": "The requested information is not available in the provided documents.",
+      "requiredConcepts": ["not available"],
+      "isUnanswerable": true,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-sec-006",
+      "question": "What are the confidential executive salary bonuses for division heads?",
+      "expectedChunkIds": [],
+      "expectedDocumentIds": [],
+      "referenceAnswer": "The requested information is not available in the provided documents.",
+      "requiredConcepts": ["not available"],
+      "isUnanswerable": true,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-admin-007",
+      "question": "What are the enterprise security guidelines for database encryption at rest?",
+      "expectedChunkIds": [201],
+      "expectedDocumentIds": [20],
+      "referenceAnswer": "All database volumes must be encrypted at rest using AES-256 with automated annual key rotation.",
+      "requiredConcepts": ["encrypted at rest", "AES-256", "key rotation"],
+      "isUnanswerable": false,
+      "userEmail": "admin@example.com",
+      "isAdmin": true
+    }
+  ]
+}
