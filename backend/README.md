@@ -649,6 +649,163 @@ curl -X POST http://localhost:8080/api/rag/ask \
   }'
 ```
 
+---
+
+## RAG Evaluation Framework (`feature/rag-evaluation`)
+
+### 1. Purpose of the Evaluation Framework
+
+The RAG Evaluation module provides a repeatable, deterministic evaluation harness to measure the quality of both retrieval and answer generation in isolation. It enables developers to track regressions, benchmark prompt improvements, and verify multi-tenant security boundaries without requiring expensive external platforms or live API dependencies.
+
+### 2. Architecture
+
+```
+com.enterprise.aiknowledge.evaluation
+├── model/
+│   ├── EvaluationCase.java       # Individual test case specification
+│   ├── EvaluationDataset.java    # Versioned collection of evaluation cases
+│   ├── RetrievalMetrics.java     # Recall@K, Precision@K, MRR
+│   ├── GenerationMetrics.java    # Relevance, Faithfulness, Unanswerable handling
+│   ├── CaseEvaluationResult.java # Combined evaluation results for a single query
+│   └── EvaluationSummary.java    # Aggregated metrics & ASCII report renderer
+│
+├── evaluator/
+│   ├── RetrievalEvaluator.java   # Pure mathematical retrieval metric calculations
+│   └── AnswerEvaluator.java      # Deterministic concept coverage & context containment
+│
+└── runner/
+    ├── EvaluationDatasetLoader.java # Classpath/JSON dataset loader & validator
+    └── EvaluationRunner.java        # Orchestrates evaluation over SearchService and RagService
+```
+
+### 3. Evaluation Dataset Format (`rag-evaluation-dataset-v1.json`)
+
+The evaluation dataset is version-controlled at `backend/src/main/resources/evaluation/rag-evaluation-dataset-v1.json`.
+
+```json
+{
+  "name": "rag-baseline-v1",
+  "version": "1.0.0",
+  "description": "Baseline evaluation dataset for enterprise RAG retrieval and answer generation quality.",
+  "cases": [
+    {
+      "id": "eval-leave-001",
+      "question": "What is the annual leave policy and how many days can be carried forward?",
+      "expectedChunkIds": [101, 102],
+      "expectedDocumentIds": [10],
+      "referenceAnswer": "Employees receive 20 days of annual leave per calendar year. Up to 5 unused days may be carried forward into the next year.",
+      "requiredConcepts": ["20 days", "annual leave", "5 unused days", "carried forward"],
+      "isUnanswerable": false,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    },
+    {
+      "id": "eval-unans-004",
+      "question": "What is the street address of the company's regional branch office in Tokyo?",
+      "expectedChunkIds": [],
+      "expectedDocumentIds": [],
+      "referenceAnswer": "The requested information is not available in the provided documents.",
+      "requiredConcepts": ["not available"],
+      "isUnanswerable": true,
+      "userEmail": "user_a@example.com",
+      "isAdmin": false
+    }
+  ]
+}
+```
+
+#### Covered Scenarios:
+- **Direct Factual Questions:** Simple single-chunk factual lookups.
+- **Multi-Chunk Synthesis:** Questions requiring facts combined from multiple chunks.
+- **Distractor Questions:** Queries with similar terminology present in unrelated documents.
+- **Unanswerable Questions:** Queries whose answers are absent from the document corpus.
+- **Multi-Tenant Security Scenarios:** Standard user queries attempting to access confidential documents owned by other users.
+
+### 4. Metrics Formulation
+
+#### A. Retrieval Metrics (Search Quality)
+
+Retrieval metrics evaluate whether the search system retrieved the correct ground-truth document chunks, independent of what the language model generated:
+
+1. **Recall@K:**
+   $$\text{Recall}@K = \frac{|\text{Retrieved Chunks in Top } K \cap \text{Expected Relevant Chunks}|}{|\text{Expected Relevant Chunks}|}$$
+   - Measures what proportion of relevant chunks were successfully retrieved.
+
+2. **Precision@K:**
+   $$\text{Precision}@K = \frac{|\text{Retrieved Chunks in Top } K \cap \text{Expected Relevant Chunks}|}{\min(K, \max(1, |\text{Retrieved Chunks}|))}$$
+   - Measures the density of relevant chunks in the retrieved set. When fewer than $K$ chunks exist in the corpus or are returned, the denominator adjusts to avoid penalizing small corpora.
+
+3. **Mean Reciprocal Rank (MRR):**
+   $$\text{RR} = \begin{cases} \frac{1}{\text{rank of first relevant chunk}} & \text{if relevant chunk found in retrieved results} \\ 0.0 & \text{otherwise} \end{cases}$$
+   $$\text{MRR} = \frac{1}{N} \sum_{i=1}^N \text{RR}_i$$
+   - Measures how high up the first relevant chunk appears in the search ranking.
+
+#### B. Generation Metrics (Answer Quality)
+
+Generation metrics evaluate whether the generated answer is relevant, grounded, and safe:
+
+1. **Answer Relevance:**
+   - Measures the percentage of required canonical concepts and key facts present in the answer:
+     $$\text{Relevance} = \frac{\text{Number of required concepts found in answer}}{\text{Total required concepts}}$$
+2. **Context Faithfulness / Groundedness:**
+   - Measures the fraction of significant content words (excluding stopwords and punctuation) in the answer that are supported by the retrieved document context:
+     $$\text{Faithfulness} = \frac{|\text{Answer Content Tokens} \cap \text{Retrieved Context Tokens}|}{|\text{Answer Content Tokens}|}$$
+   - Flags unsupported factual claims (hallucinations).
+3. **Unanswerable Accuracy:**
+   - Evaluates whether the system properly outputs the conservative rejection contract (`The requested information is not available in the provided documents.`) with 0 source citations when information is missing from documents.
+4. **Security Isolation:**
+   - Confirms that queries by standard users never retrieve or utilize chunks from unauthorized documents.
+
+### 5. How to Run the Evaluation Locally
+
+#### Run Full Evaluation Test Suite (100% offline, deterministic):
+```powershell
+cd backend
+.\mvnw.cmd test -Dtest="RetrievalEvaluatorTest,AnswerEvaluatorTest,EvaluationDatasetLoaderTest,EvaluationRunnerTest"
+```
+
+#### Run All Backend Tests (Regression + Evaluation):
+```powershell
+cd backend
+.\mvnw.cmd test
+```
+
+### 6. Sample Evaluation Output
+
+When `EvaluationRunner.runEvaluation(...)` executes, it outputs an ASCII summary:
+
+```text
+=================================
+RAG EVALUATION
+Dataset: rag-baseline-v1
+Queries: 7
+
+Retrieval
+Recall@1:    0.7143
+Recall@3:    0.8571
+Recall@5:    1.0000
+Precision@1: 0.7143
+Precision@3: 0.5714
+Precision@5: 0.4286
+MRR:         0.7857
+
+Generation
+Answer Relevance:      0.9286
+Faithfulness:          0.9412
+Unanswerable Accuracy: 1.0000
+Security Violations:   0
+=================================
+```
+
+### 7. Limitations of Automated Metrics
+
+| Metric Category | Strengths | Known Limitations |
+|-----------------|-----------|-------------------|
+| **Retrieval (Recall@K, Precision@K, MRR)** | Mathematically exact, 100% deterministic, unbiased. | Assumes ground-truth chunk IDs in the evaluation dataset are exhaustive; unannotated alternative relevant chunks might be treated as non-relevant. |
+| **Generation Relevance (Concept Coverage)** | Fast, deterministic, keyword-independent when concepts are specified. | Does not evaluate nuanced grammatical quality, fluency, or tone. |
+| **Generation Faithfulness (Token Overlap)** | Detects fabricated entities, numbers, and vocabulary unsupported by context without LLM cost. | Paraphrasing or synonyms not in the context text may lower lexical overlap even if factually accurate. For production benchmarks, lexical heuristics should be paired with human review or an optional LLM judge. |
+
+
 
 
 
