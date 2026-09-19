@@ -65,6 +65,13 @@ gemini:
     batch-size: 10
     max-retries: 3
     retry-delay-ms: 100
+  generation:
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max-output-tokens: 1024
+    max-context-characters: 8000
+    max-retries: 3
+    retry-delay-ms: 50
 
 qdrant:
   host: localhost

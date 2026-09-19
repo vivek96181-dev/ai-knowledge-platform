@@ -80,6 +80,13 @@ gemini:
     batch-size: ${GEMINI_EMBEDDING_BATCH_SIZE:10}
     max-retries: ${GEMINI_EMBEDDING_MAX_RETRIES:3}
     retry-delay-ms: ${GEMINI_EMBEDDING_RETRY_DELAY_MS:500}
+  generation:
+    model: ${GEMINI_GENERATION_MODEL:gemini-2.5-flash}
+    temperature: ${GEMINI_GENERATION_TEMPERATURE:0.2}
+    max-output-tokens: ${GEMINI_GENERATION_MAX_OUTPUT_TOKENS:1024}
+    max-context-characters: ${GEMINI_RAG_MAX_CONTEXT_CHARACTERS:8000}
+    max-retries: ${GEMINI_GENERATION_MAX_RETRIES:3}
+    retry-delay-ms: ${GEMINI_GENERATION_RETRY_DELAY_MS:500}
 
 # Qdrant Vector Database configuration
 qdrant:

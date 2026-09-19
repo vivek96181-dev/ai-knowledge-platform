@@ -463,5 +463,192 @@ curl -X POST http://localhost:8080/api/search \
   }'
 ```
 
+---
+
+## Retrieval-Augmented Generation (RAG) (`feature/rag`)
+
+### 1. RAG Architecture & Flow
+
+The RAG pipeline grounds Gemini LLM text generation strictly in enterprise documents retrieved through the authenticated semantic search engine.
+
+```
+Client (POST /api/rag/ask)
+       │
+       ▼
+RagController (JWT Authentication & Principal Extraction)
+       │
+       ▼
+RagService (Orchestrator)
+       │
+       ├── 1. Validate query & topK bounds
+       │
+       ├── 2. Retrieve authorized chunks via SearchService (SemanticSearchService)
+       │       ├── Generate 768-dim query embedding (Gemini Embedding 2)
+       │       ├── Qdrant similarity search (payload ownerId filter for USER; cross-tenant for ADMIN)
+       │       └── PostgreSQL batch hydration (findAllWithDocumentAndOwnerByIdIn)
+       │
+       ├── 3. Insufficient Context Evaluation:
+       │       └── If 0 chunks retrieved: immediately return conservative response without calling Gemini
+       │
+       ├── 4. Bounded Context Construction via ContextBuilder:
+       │       ├── Formats distinct [SOURCE N] metadata blocks
+       │       ├── Enforces maxContextCharacters budget (default: 8000 chars)
+       │       └── Excludes lower-ranked chunks if budget reached (never truncates midway)
+       │
+       ├── 5. Answer Generation via GenerationService (GeminiGenerationService):
+       │       ├── Separate system instructions, context blocks, and user query
+       │       ├── Model: gemini-2.5-flash (temperature: 0.2, maxOutputTokens: 1024)
+       │       └── Bounded retries for transient errors (429, 503, timeouts)
+       │
+       └── 6. Source Mapping:
+               └── Map actual included search results to structured RagSource references
+       │
+       ▼
+Return RagResponse (query, answer, sources)
+```
+
+### 2. Grounding Strategy & System Instruction
+
+The generation service enforces strict grounding using dedicated system instructions configured on `GenerateContentConfig`:
+
+```text
+You are an enterprise knowledge assistant.
+
+Answer the user's question using only the supplied context.
+Do not use information that is not present in the context.
+Do not invent facts.
+When the context does not contain enough information to answer the question, clearly state that the information is not available in the provided documents.
+Keep the answer concise and factual.
+Do not claim that something is present in the documents unless it is supported by the supplied context.
+```
+
+The prompt sent to Gemini strictly delineates between retrieved context and user query:
+
+```text
+CONTEXT:
+[SOURCE 1]
+Document ID: 12
+Chunk ID: 45
+Page: 7
+
+Employees receive 20 days of annual leave per calendar year...
+
+[SOURCE 2]
+Document ID: 12
+Chunk ID: 46
+Page: 8
+
+Unused leave may be carried forward up to a maximum of 5 days...
+
+USER QUESTION:
+What is the company's leave policy?
+```
+
+### 3. Insufficient-Context Behavior
+
+When semantic search returns 0 matching chunks or when no chunks fit the context budget:
+- `RagService` returns immediately with:
+  `"The requested information is not available in the provided documents."`
+- The `sources` array is empty `[]`.
+- **No call is made to Gemini**, preventing unnecessary API latency, cost, and hallucination.
+
+### 4. Bounded Context Strategy
+
+To prevent unbounded prompt growth:
+- Chunks are appended in strict retrieval ranking order.
+- If adding a chunk would exceed `gemini.generation.max-context-characters` (default: 8000), lower-ranked chunks are excluded.
+- Chunks are **never** truncated midway, preventing partial/corrupted sentences from misleading the model.
+- Only the chunks that actually fit within the context budget are returned in `sources`.
+
+### 5. Multi-Tenant Security Model
+
+- **Standard Users (`ROLE_USER`):** Only chunks belonging to documents owned by the authenticated user are retrieved and injected into the prompt context.
+- **Administrators (`ROLE_ADMIN`):** May search and generate answers across all documents in the platform.
+- **Zero Secret/Vector Exposure:** The API response never exposes raw embedding vectors, Qdrant internal IDs, server storage paths, or database credentials.
+
+### 6. Endpoint Specification: `POST /api/rag/ask`
+
+**Headers:**
+- `Authorization: Bearer <JWT_TOKEN>`
+- `Content-Type: application/json`
+
+**Request Body:**
+```json
+{
+  "query": "What is the company's leave policy?",
+  "topK": 5
+}
+```
+
+**Field Rules:**
+- `query` (string, required): Cannot be blank. Max 1000 characters. Trimmed automatically.
+- `topK` (integer, optional): 1 to 20. Defaults to `search.default-top-k` (5).
+
+**Response Body (`200 OK`):**
+```json
+{
+  "query": "What is the company's leave policy?",
+  "answer": "Employees receive 20 days of annual leave per calendar year. Up to 5 unused days may be carried forward into the next year.",
+  "sources": [
+    {
+      "documentId": 12,
+      "chunkId": 45,
+      "pageNumber": 7,
+      "chunkIndex": 3,
+      "score": 0.8932
+    },
+    {
+      "documentId": 12,
+      "chunkId": 46,
+      "pageNumber": 8,
+      "chunkIndex": 4,
+      "score": 0.8617
+    }
+  ]
+}
+```
+
+### 7. API Errors
+
+| HTTP Status | Error Type | Description |
+|-------------|------------|-------------|
+| `400 Bad Request` | `IllegalArgumentException` / `MethodArgumentNotValidException` | Blank query, query > 1000 chars, topK < 1 or > 20 |
+| `401 Unauthorized` | `SecurityAuthenticationEntryPoint` | Missing, expired, or invalid JWT token |
+| `403 Forbidden` | `AccessDeniedException` | Insufficient permissions |
+| `502 Bad Gateway` | `GenerationServiceException` | Gemini API unavailable, rate limited after max retries, or empty model response |
+| `500 Internal Server Error` | `Exception` | Unexpected server failure |
+
+### 8. Configuration
+
+In `application.yml`:
+```yaml
+gemini:
+  api-key: ${GEMINI_API_KEY:}
+  embedding:
+    model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-2}
+    dimensions: ${GEMINI_EMBEDDING_DIMENSIONS:768}
+  generation:
+    model: ${GEMINI_GENERATION_MODEL:gemini-2.5-flash}
+    temperature: ${GEMINI_GENERATION_TEMPERATURE:0.2}
+    max-output-tokens: ${GEMINI_GENERATION_MAX_OUTPUT_TOKENS:1024}
+    max-context-characters: ${GEMINI_RAG_MAX_CONTEXT_CHARACTERS:8000}
+    max-retries: ${GEMINI_GENERATION_MAX_RETRIES:3}
+    retry-delay-ms: ${GEMINI_GENERATION_RETRY_DELAY_MS:500}
+```
+
+### 9. Example `curl` Commands
+
+```bash
+# 1. Ask a question via RAG
+curl -X POST http://localhost:8080/api/rag/ask \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What is the policy for carrying over unused vacation days?",
+    "topK": 5
+  }'
+```
+
+
 
 

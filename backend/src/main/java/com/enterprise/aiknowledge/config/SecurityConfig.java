@@ -87,6 +87,7 @@ public class SecurityConfig {
                 .requestMatchers("/api/auth/me").authenticated()                      // Current user info
                 .requestMatchers("/api/documents/**").authenticated()                 // Document management
                 .requestMatchers(HttpMethod.POST, "/api/search").authenticated()      // Semantic search
+                .requestMatchers(HttpMethod.POST, "/api/rag/ask").authenticated()     // Retrieval-Augmented Generation (RAG)
 
                 // Everything else also requires authentication (safe default)
                 .anyRequest().authenticated()

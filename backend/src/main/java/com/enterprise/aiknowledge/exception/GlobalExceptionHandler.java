@@ -166,6 +166,24 @@ public class GlobalExceptionHandler {
         return new ResponseEntity<>(errorResponse, HttpStatus.UNAUTHORIZED);
     }
 
+    /**
+     * Handles failures in external LLM generation services without exposing stack traces or API keys.
+     * Returns HTTP 502 Bad Gateway.
+     */
+    @ExceptionHandler(GenerationServiceException.class)
+    public ResponseEntity<ErrorResponse> handleGenerationServiceException(
+            GenerationServiceException ex,
+            HttpServletRequest request
+    ) {
+        ErrorResponse errorResponse = new ErrorResponse(
+                HttpStatus.BAD_GATEWAY.value(),
+                HttpStatus.BAD_GATEWAY.getReasonPhrase(),
+                "AI generation service temporarily unavailable: " + ex.getMessage(),
+                request.getRequestURI()
+        );
+        return new ResponseEntity<>(errorResponse, HttpStatus.BAD_GATEWAY);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleGenericException(
             Exception ex,
