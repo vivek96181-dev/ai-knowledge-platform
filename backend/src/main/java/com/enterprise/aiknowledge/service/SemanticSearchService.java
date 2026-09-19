@@ -35,7 +35,7 @@ import java.util.stream.Collectors;
  * </p>
  */
 @Service
-public class SemanticSearchService {
+public class SemanticSearchService implements SearchService {
 
     private static final Logger log = LoggerFactory.getLogger(SemanticSearchService.class);
 
@@ -70,6 +70,7 @@ public class SemanticSearchService {
      * @param isAdmin          whether the authenticated user has ROLE_ADMIN
      * @return structured search response containing ranked search results
      */
+    @Override
     @Transactional(readOnly = true)
     public SearchResponse search(SearchRequest request, String currentUserEmail, boolean isAdmin) {
         // Step 1: Input validation
@@ -148,10 +149,12 @@ public class SemanticSearchService {
         return new SearchResponse(trimmedQuery, results);
     }
 
+    @Override
     public int getDefaultTopK() {
         return defaultTopK;
     }
 
+    @Override
     public int getMaxTopK() {
         return maxTopK;
     }
