@@ -1,5 +1,7 @@
 package com.enterprise.aiknowledge.service;
 
+import com.enterprise.aiknowledge.dto.CandidateResult;
+import com.enterprise.aiknowledge.dto.RetrievalSourceType;
 import com.enterprise.aiknowledge.dto.SearchRequest;
 import com.enterprise.aiknowledge.dto.SearchResponse;
 import com.enterprise.aiknowledge.dto.SearchResult;
@@ -147,6 +149,35 @@ public class SemanticSearchService implements SearchService {
                 scoredPoints.size(), results.size());
 
         return new SearchResponse(trimmedQuery, results);
+    }
+
+    /**
+     * Retrieves semantic search candidate matches without hydrating chunk text from the database.
+     * Used by {@link HybridSearchService} to retrieve vector candidates for Reciprocal Rank Fusion.
+     *
+     * @param query          natural language query
+     * @param candidateLimit maximum number of candidate points to retrieve
+     * @param targetOwnerId  optional owner ID to filter results (null for ADMIN cross-tenant search)
+     * @return 1-ranked list of semantic candidate matches
+     */
+    public List<CandidateResult> retrieveCandidates(String query, int candidateLimit, Long targetOwnerId) {
+        if (query == null || query.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<Float> queryVector = embeddingService.generateEmbedding(query.trim());
+        List<ScoredChunkDto> scoredPoints = vectorStoreService.search(queryVector, candidateLimit, targetOwnerId);
+        List<CandidateResult> candidates = new ArrayList<>(scoredPoints.size());
+        for (int i = 0; i < scoredPoints.size(); i++) {
+            ScoredChunkDto pt = scoredPoints.get(i);
+            candidates.add(new CandidateResult(
+                    pt.chunkId(),
+                    pt.documentId(),
+                    pt.score(),
+                    i + 1,
+                    RetrievalSourceType.SEMANTIC
+            ));
+        }
+        return candidates;
     }
 
     @Override
