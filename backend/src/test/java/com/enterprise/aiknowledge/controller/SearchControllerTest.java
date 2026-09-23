@@ -1,6 +1,11 @@
 package com.enterprise.aiknowledge.controller;
 
+import com.enterprise.aiknowledge.dto.CandidateResult;
+import com.enterprise.aiknowledge.dto.RetrievalSourceType;
+import com.enterprise.aiknowledge.dto.SearchMode;
 import com.enterprise.aiknowledge.dto.SearchRequest;
+import com.enterprise.aiknowledge.dto.SearchResponse;
+import com.enterprise.aiknowledge.dto.SearchResult;
 import com.enterprise.aiknowledge.model.Document;
 import com.enterprise.aiknowledge.model.DocumentChunk;
 import com.enterprise.aiknowledge.model.DocumentStatus;
@@ -12,6 +17,7 @@ import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.repository.UserRepository;
 import com.enterprise.aiknowledge.service.EmbeddingService;
+import com.enterprise.aiknowledge.service.KeywordSearchService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
 import com.enterprise.aiknowledge.service.ScoredChunkDto;
 import com.enterprise.aiknowledge.service.VectorStoreService;
@@ -35,6 +41,7 @@ import static org.hamcrest.Matchers.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.when;
@@ -44,7 +51,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * MockMvc integration and security tests for {@code POST /api/search}.
+ * MockMvc integration and security tests for {@code POST /api/search} and {@code POST /api/search/hybrid}.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -63,6 +70,7 @@ class SearchControllerTest {
 
     @MockBean private EmbeddingService embeddingService;
     @MockBean private VectorStoreService vectorStoreService;
+    @MockBean private KeywordSearchService keywordSearchService;
 
     private static final String SEARCH_URL = "/api/search";
     private static final String USER_A_EMAIL = "user_a@example.com";
@@ -241,4 +249,104 @@ class SearchControllerTest {
                 .andExpect(jsonPath("$.results[1].chunkId").value(chunkB.getId()))
                 .andExpect(jsonPath("$.results[1].score").value(0.89));
     }
+
+    // =========================================================================
+    // 3. Hybrid Search & Keyword Search Tests
+    // =========================================================================
+
+    @Test
+    @DisplayName("Search with mode HYBRID executes Reciprocal Rank Fusion of vector and keyword matches")
+    void searchWithHybridModeFusesResults() throws Exception {
+        Document docA = createDocument(userA, "docA.pdf");
+        DocumentChunk chunk1 = createChunk(docA, 1, 0, "Chunk 1 leave policy.");
+        DocumentChunk chunk2 = createChunk(docA, 2, 1, "Chunk 2 vacation time.");
+
+        // Semantic returns chunk1 (rank 1), chunk2 (rank 2)
+        when(vectorStoreService.search(anyList(), anyInt(), eq(userA.getId())))
+                .thenReturn(List.of(
+                        new ScoredChunkDto(chunk1.getId(), docA.getId(), 1, 0, userA.getId(), 0.90f),
+                        new ScoredChunkDto(chunk2.getId(), docA.getId(), 2, 1, userA.getId(), 0.70f)
+                ));
+
+        // Keyword returns chunk2 (rank 1)
+        when(keywordSearchService.retrieveCandidates(eq("leave policy"), anyInt(), eq(userA.getId())))
+                .thenReturn(List.of(
+                        new CandidateResult(chunk2.getId(), docA.getId(), 0.85f, 1, RetrievalSourceType.KEYWORD)
+                ));
+
+        SearchRequest request = new SearchRequest("leave policy", 5, SearchMode.HYBRID);
+
+        // chunk2 gets boosted by appearing in both lists: (1/62) + (1/61) > (1/61)
+        mockMvc.perform(post(SEARCH_URL)
+                        .with(user(USER_A_EMAIL).roles("USER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.query").value("leave policy"))
+                .andExpect(jsonPath("$.results", hasSize(2)))
+                .andExpect(jsonPath("$.results[0].chunkId").value(chunk2.getId()))
+                .andExpect(jsonPath("$.results[0].text").value("Chunk 2 vacation time."))
+                .andExpect(jsonPath("$.results[1].chunkId").value(chunk1.getId()))
+                .andExpect(jsonPath("$.results[1].text").value("Chunk 1 leave policy."));
+    }
+
+    @Test
+    @DisplayName("Search with mode KEYWORD routes to KeywordSearchService")
+    void searchWithKeywordModeRoutesToKeywordService() throws Exception {
+        Document docA = createDocument(userA, "docA.pdf");
+        DocumentChunk chunkA = createChunk(docA, 1, 0, "Keyword matched text.");
+
+        SearchResponse mockResponse = new SearchResponse("keyword query", List.of(
+                new SearchResult(docA.getId(), chunkA.getId(), 1, 0, 0.75f, "Keyword matched text.")
+        ));
+        when(keywordSearchService.search(any(), eq(USER_A_EMAIL), eq(false))).thenReturn(mockResponse);
+
+        SearchRequest request = new SearchRequest("keyword query", 5, SearchMode.KEYWORD);
+
+        mockMvc.perform(post(SEARCH_URL)
+                        .with(user(USER_A_EMAIL).roles("USER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.query").value("keyword query"))
+                .andExpect(jsonPath("$.results", hasSize(1)))
+                .andExpect(jsonPath("$.results[0].chunkId").value(chunkA.getId()));
+    }
+
+    @Test
+    @DisplayName("Dedicated /api/search/hybrid endpoint returns RRF fused results")
+    void dedicatedHybridEndpointWorks() throws Exception {
+        Document docA = createDocument(userA, "docA.pdf");
+        DocumentChunk chunkA = createChunk(docA, 1, 0, "Hybrid chunk content.");
+
+        when(vectorStoreService.search(anyList(), anyInt(), eq(userA.getId())))
+                .thenReturn(List.of(
+                        new ScoredChunkDto(chunkA.getId(), docA.getId(), 1, 0, userA.getId(), 0.95f)
+                ));
+        when(keywordSearchService.retrieveCandidates(anyString(), anyInt(), eq(userA.getId())))
+                .thenReturn(Collections.emptyList());
+
+        SearchRequest request = new SearchRequest("hybrid test", 5);
+
+        mockMvc.perform(post("/api/search/hybrid")
+                        .with(user(USER_A_EMAIL).roles("USER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.query").value("hybrid test"))
+                .andExpect(jsonPath("$.results", hasSize(1)))
+                .andExpect(jsonPath("$.results[0].chunkId").value(chunkA.getId()));
+    }
+
+    @Test
+    @DisplayName("Unauthenticated /api/search/hybrid request returns 401 Unauthorized")
+    void unauthenticatedHybridEndpointReturns401() throws Exception {
+        SearchRequest request = new SearchRequest("hybrid test", 5);
+
+        mockMvc.perform(post("/api/search/hybrid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isUnauthorized());
+    }
 }
+

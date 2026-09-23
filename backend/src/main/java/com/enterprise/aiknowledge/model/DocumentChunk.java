@@ -54,9 +54,11 @@ public class DocumentChunk {
 
     /**
      * Text content of this chunk.
+     * Mapped via LONGVARCHAR so PostgreSQL creates a native text column (instead of oid)
+     * while H2 dialect in tests safely creates a clob without unquoted domain errors.
      */
-    @Lob
-    @Column(nullable = false)
+    @org.hibernate.annotations.JdbcTypeCode(org.hibernate.type.SqlTypes.LONGVARCHAR)
+    @Column(name = "text", nullable = false)
     private String text;
 
     /**

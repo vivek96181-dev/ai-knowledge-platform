@@ -85,6 +85,16 @@ qdrant:
 search:
   default-top-k: 5
   max-top-k: 20
+  fts:
+    language: english
+  hybrid:
+    enabled: true
+    rrf-k: 60
+    semantic-weight: 1.0
+    keyword-weight: 1.0
+    semantic-candidates: 20
+    keyword-candidates: 20
+
 
 
 

@@ -60,6 +60,34 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
 - State-based idempotency: skips duplicate processing if document is already `COMPLETED` and `DocumentText` is present
 - Full automated integration test suite (50 total tests passing)
 
+### Phase 7 — Deterministic Page-Aware Document Chunking
+- Page-boundary-aware recursive chunker with sliding character window and configurable overlap
+- `DocumentChunk` entity with page citation metadata (`pageNumber`, `characterStart`, `characterEnd`)
+
+### Phase 8 — High-Dimensional Vector Embeddings via Gemini
+- Gemini Embedding 2 integration producing 768-dimensional normalized vectors
+- `DocumentChunkEmbedding` metadata persistence with transaction rollback guarantees
+
+### Phase 9 — Qdrant Vector Storage & Semantic Search
+- Qdrant gRPC client (`io.qdrant:client:1.19.0`) aligned with fixed Qdrant server (`qdrant/qdrant:v1.19.1`) via Docker Compose
+- Collection `document_chunks` verified with 768 dimensions and Cosine distance metric
+- Deterministic UUID generation and payload indexing
+- Semantic vector similarity search (`POST /api/search`) with multi-tenant filtering
+
+### Phase 10 — Grounded Retrieval-Augmented Generation (RAG) & Evaluation
+- Strict contextual grounding via Gemini 2.5 Flash (`POST /api/rag/ask`)
+- Automated evaluation framework measuring Recall@K, Precision@K, MRR, Faithfulness, and Concept Relevance
+
+### Phase 11 — Hybrid Search (PostgreSQL FTS + Qdrant Vector + Reciprocal Rank Fusion)
+- Lexical full-text retrieval using PostgreSQL native FTS (`websearch_to_tsquery`, `to_tsvector`, `ts_rank_cd`)
+- PostgreSQL GIN expression index (`idx_document_chunks_fts`) for accelerated lexical scanning
+- Reciprocal Rank Fusion (RRF) algorithm fusing dense semantic and lexical candidate lists
+- Configurable RRF parameters: constant \( k \) (default 60), semantic weight (1.0), keyword weight (1.0)
+- Unified search API supporting `SEMANTIC`, `KEYWORD`, and `HYBRID` retrieval modes with dedicated `/api/search/hybrid` endpoint
+- 100% backward-compatible API defaulting to `SEMANTIC` for existing clients
+- Strict multi-tenant isolation enforced in database queries and defense-in-depth in-memory verification
+- 189 total automated unit and integration tests passing
+
 ---
 
 ## 1. Architecture & End-to-End Flow
@@ -804,6 +832,210 @@ Security Violations:   0
 | **Retrieval (Recall@K, Precision@K, MRR)** | Mathematically exact, 100% deterministic, unbiased. | Assumes ground-truth chunk IDs in the evaluation dataset are exhaustive; unannotated alternative relevant chunks might be treated as non-relevant. |
 | **Generation Relevance (Concept Coverage)** | Fast, deterministic, keyword-independent when concepts are specified. | Does not evaluate nuanced grammatical quality, fluency, or tone. |
 | **Generation Faithfulness (Token Overlap)** | Detects fabricated entities, numbers, and vocabulary unsupported by context without LLM cost. | Paraphrasing or synonyms not in the context text may lower lexical overlap even if factually accurate. For production benchmarks, lexical heuristics should be paired with human review or an optional LLM judge. |
+
+---
+
+## Phase 11 — Hybrid Search & Reciprocal Rank Fusion
+
+Hybrid search combines the strengths of **dense semantic retrieval** (capturing conceptual meaning and synonyms via vector embeddings) with **sparse lexical retrieval** (capturing exact product names, error codes, identifiers, and acronyms via PostgreSQL Full-Text Search). The candidate lists are merged into an optimal final ranking using **Reciprocal Rank Fusion (RRF)**.
+
+### 1. Architecture & Retrieval Flow
+
+```
+                              User Natural Language Query
+                                           │
+                     ┌─────────────────────┴─────────────────────┐
+                     │                                           │
+                     ▼                                           ▼
+          [Semantic Vector Search]                    [Keyword Lexical Search]
+         Gemini Embedding 2 (768-d)                  PostgreSQL Full-Text Search
+                     │                                websearch_to_tsquery('english', q)
+                     ▼                                           │
+         Qdrant Vector Database                                  ▼
+      Cosine Similarity Nearest Neighbors             PostgreSQL GIN Expression Index
+        (Bounded candidates, Top-M)                 ts_rank_cd Cover Density Ranking
+                     │                                  (Bounded candidates, Top-N)
+                     │                                           │
+                     └─────────────────────┬─────────────────────┘
+                                           │
+                                           ▼
+                           [Reciprocal Rank Fusion (RRF)]
+                               score = Σ w_s / (k + r_s)
+                           Deterministic Tie-Breaking
+                            (score DESC, chunkId ASC)
+                                           │
+                                           ▼
+                                    Final Top-K
+                                           │
+                                           ▼
+                           [PostgreSQL Batch Hydration]
+                     Single SELECT ... WHERE id IN (:topKIds)
+                    (Zero N+1 queries, Owner Defense-in-Depth)
+                                           │
+                                           ▼
+                                 SearchResult List
+                           (Fused Score, Chunk Content,
+                              Document & Page Metadata)
+```
+
+### 2. Retrieval Strategies Comparison
+
+| Dimension | Semantic Vector Search (Qdrant) | Keyword Lexical Search (PostgreSQL FTS) | Hybrid Search (RRF) |
+|---|---|---|---|
+| **Mechanism** | Dense 768-d embeddings, Cosine distance | Tokenized lexemes, inverted GIN index, `ts_rank_cd` | Rank-based reciprocal rank score fusion |
+| **Best For** | Paraphrases, conceptual questions, thematic similarity | Exact IDs, proper nouns, error strings, acronyms | Best of both worlds: robust across all query types |
+| **Weakness** | Can miss rare exact numbers/acronyms | Vocabulary mismatch (fails on paraphrasing/synonyms) | Slight compute overhead of executing dual queries |
+| **Score Scale** | Cosine similarity: `[-1.0, 1.0]` | Cover density: unbounded positive `[0.0, ∞)` | Reciprocal rank score: `(0.0, 2 / (k+1)]` |
+| **Scale Bias** | Susceptible to model temperature/calibration | Susceptible to document length & term frequency | **Zero scale bias** (fuses purely based on rank order) |
+
+### 3. PostgreSQL Full-Text Search Strategy
+
+- **Query Tokenization:** Evaluated using PostgreSQL `websearch_to_tsquery(cast(:language as regconfig), :query)`. This function is safe against syntax errors from arbitrary user input (unclosed quotes, boolean operators, punctuation).
+- **Ranking Function:** Uses `ts_rank_cd(...)` (cover density ranking), which rewards chunks where query search terms appear close to one another within the chunk text.
+- **Index Acceleration:** Accelerated via a PostgreSQL GIN (Generalized Inverted Index) expression index:
+  ```sql
+  CREATE INDEX IF NOT EXISTS idx_document_chunks_fts
+  ON document_chunks USING gin (to_tsvector('english', coalesce(text, '')));
+  ```
+- **Startup Verification (`PostgresFtsIndexInitializer`):** Automatically and idempotently creates the GIN index on application startup when connected to a PostgreSQL database, while safely skipping during offline test execution against in-memory H2.
+- **Source of Truth:** All document chunk text and metadata reside exclusively in PostgreSQL.
+
+### 4. Reciprocal Rank Fusion (RRF) Formulation
+
+Reciprocal Rank Fusion fuses ranked lists without requiring score normalization or calibration across different score distributions:
+
+$$\text{RRF Score}(d) = \sum_{s \in \{\text{semantic}, \text{keyword}\}} w_s \cdot \frac{1}{k + r_s(d)}$$
+
+Where:
+- $r_s(d) \ge 1$: The 1-based rank position of chunk $d$ in retrieval system $s$.
+- $k$: Configurable smoothing constant (default: `60`). Higher $k$ reduces the score difference between adjacent ranks.
+- $w_{\text{semantic}}$: Configurable weight for semantic retrieval (default: `1.0`).
+- $w_{\text{keyword}}$: Configurable weight for keyword retrieval (default: `1.0`).
+
+#### Overlap & Tie-Breaking Rules:
+1. **Chunks in Both Lists:** Accumulate contributions from both sources ($w_{\text{sem}} / (k + r_{\text{sem}}) + w_{\text{kw}} / (k + r_{\text{kw}})$), earning a natural rank boost.
+2. **Chunks in One List:** Receive that source's contribution with $0.0$ from the missing source.
+3. **Deterministic Tie-Breaking:** If two chunks achieve identical fused scores:
+   - Primary sort: `fusedScore` descending
+   - Secondary sort: `chunkId` ascending
+
+> [!NOTE]
+> **Fused Score Interpretation:** The `score` field returned in hybrid search results is an RRF ranking score (typically between `0.01` and `0.04` with $k=60$), **NOT** a cosine similarity score. It reflects reciprocal rank strength and should be used exclusively for ordering.
+
+### 5. Configuration Reference
+
+All hybrid search parameters follow the 12-factor configuration pattern via environment variables with safe defaults:
+
+| Property | Environment Variable | Default | Description |
+|---|---|---|---|
+| `search.fts.language` | `SEARCH_FTS_LANGUAGE` | `english` | PostgreSQL text search configuration language |
+| `search.hybrid.enabled` | `SEARCH_HYBRID_ENABLED` | `true` | Feature toggle for hybrid search service |
+| `search.hybrid.rrf-k` | `SEARCH_HYBRID_RRF_K` | `60` | RRF smoothing constant \( k \) in \( 1 / (k + r) \) |
+| `search.hybrid.semantic-weight` | `SEARCH_HYBRID_SEMANTIC_WEIGHT` | `1.0` | Multiplier for semantic vector retrieval contribution |
+| `search.hybrid.keyword-weight` | `SEARCH_HYBRID_KEYWORD_WEIGHT` | `1.0` | Multiplier for keyword lexical retrieval contribution |
+| `search.hybrid.semantic-candidates` | `SEARCH_HYBRID_SEMANTIC_CANDIDATES` | `20` | Candidate pool size retrieved from Qdrant |
+| `search.hybrid.keyword-candidates` | `SEARCH_HYBRID_KEYWORD_CANDIDATES` | `20` | Candidate pool size retrieved from PostgreSQL FTS |
+
+### 6. API Endpoints
+
+#### A. Unified Search Endpoint: `POST /api/search`
+
+Supports `mode`: `SEMANTIC` (default), `KEYWORD`, or `HYBRID`.
+
+**Request (`HYBRID` mode):**
+```http
+POST /api/search HTTP/1.1
+Host: localhost:8080
+Authorization: Bearer <JWT_TOKEN>
+Content-Type: application/json
+
+{
+  "query": "What is the employee annual leave rollover policy?",
+  "topK": 5,
+  "mode": "HYBRID"
+}
+```
+
+**Backward-Compatible Request (defaults to `SEMANTIC`):**
+```json
+{
+  "query": "What is the employee annual leave rollover policy?",
+  "topK": 5
+}
+```
+
+#### B. Dedicated Hybrid Endpoint: `POST /api/search/hybrid`
+
+Convenience alias dedicated to hybrid retrieval:
+```http
+POST /api/search/hybrid HTTP/1.1
+Host: localhost:8080
+Authorization: Bearer <JWT_TOKEN>
+Content-Type: application/json
+
+{
+  "query": "What is the employee annual leave rollover policy?",
+  "topK": 5
+}
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "query": "What is the employee annual leave rollover policy?",
+  "results": [
+    {
+      "documentId": 12,
+      "chunkId": 45,
+      "pageNumber": 7,
+      "chunkIndex": 3,
+      "score": 0.0325,
+      "text": "Employees receive 20 days of annual leave per calendar year. Up to 5 unused days may be carried forward into the next calendar year."
+    },
+    {
+      "documentId": 12,
+      "chunkId": 46,
+      "pageNumber": 8,
+      "chunkIndex": 4,
+      "score": 0.0164,
+      "text": "Carried forward leave must be utilized within the first quarter of the following year."
+    }
+  ]
+}
+```
+
+### 7. Multi-Tenant Security Guarantees
+
+- **Standard Users (`ROLE_USER`):**
+  - Semantic vector search in Qdrant filters by `owner_id == authenticatedUserId`.
+  - Keyword FTS in PostgreSQL filters by `documents.owner_id == authenticatedUserId`.
+  - Fused candidate chunk IDs are re-verified against `owner.id` during PostgreSQL batch hydration (defense-in-depth).
+  - Unauthenticated requests return `401 Unauthorized`.
+  - Unauthorized document access returns `0` results (never leaks foreign chunks).
+- **Administrators (`ROLE_ADMIN`):**
+  - Searches cross-tenant across all uploaded documents across all users.
+
+### 8. Performance Characteristics
+
+- **Single Bounded Vector Query:** Retrieves at most `max(topK, semanticCandidates)` from Qdrant.
+- **Single Bounded FTS Query:** Retrieves at most `max(topK, keywordCandidates)` from PostgreSQL using the GIN index.
+- **In-Memory Fusion:** RRF fusion executes in $O(M + N \log(M + N))$ time on small bounded lists ($M, N \le 20$).
+- **Single Batch Hydration:** Chunks are fetched via `documentChunkRepository.findAllWithDocumentAndOwnerByIdIn(:chunkIds)` in one `JOIN FETCH` query, eliminating N+1 database queries.
+- **Fail-Closed Resilience:** If an underlying search infrastructure fails (e.g. Qdrant unreachable or PostgreSQL timeout), hybrid search propagates the failure rather than silently returning partial degraded results under the false pretense of hybrid search.
+
+### 9. How to Run Tests Locally
+
+```powershell
+# Run pure RRF fusion metric tests
+.\mvnw.cmd test -Dtest="ReciprocalRankFuserTest"
+
+# Run hybrid search service and controller tests
+.\mvnw.cmd test -Dtest="HybridSearchServiceTest,SearchControllerTest,PostgresKeywordSearchServiceTest"
+
+# Run full project regression suite (all 189 tests)
+.\mvnw.cmd test
+```
+
 
 
 
