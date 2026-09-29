@@ -101,8 +101,17 @@ search:
     timeout-ms: 5000
     fallback-to-rrf: true
 
+# Cache disabled in unit tests (no real Redis required)
+cache:
+  enabled: false
+  key-version: v1
+  search:
+    ttl-seconds: 300
+  rag:
+    ttl-seconds: 600
 
-
+# Disable Redis auto-configuration in tests
+spring.autoconfigure.exclude: org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
 
 
 
