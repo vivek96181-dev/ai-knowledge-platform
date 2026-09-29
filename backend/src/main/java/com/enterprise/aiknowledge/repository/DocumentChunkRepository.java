@@ -55,4 +55,59 @@ public interface DocumentChunkRepository extends JpaRepository<DocumentChunk, Lo
     )
     List<DocumentChunk> findAllWithDocumentAndOwnerByIdIn(
             @org.springframework.data.repository.query.Param("ids") java.util.Collection<Long> ids);
+
+    /**
+     * Executes PostgreSQL full-text search filtered by document owner ID for multi-tenant isolation (USER role).
+     *
+     * @param query    natural-language search query evaluated via websearch_to_tsquery
+     * @param language PostgreSQL FTS text search configuration (e.g. 'english')
+     * @param ownerId  owner user ID to restrict search results to
+     * @param limit    maximum number of ranked candidates to return
+     * @return ranked keyword search matches ordered by ts_rank_cd DESC, chunkId ASC
+     */
+    @org.springframework.data.jpa.repository.Query(
+            value = """
+                    SELECT c.id AS chunkId,
+                           c.document_id AS documentId,
+                           ts_rank_cd(to_tsvector(cast(:language as regconfig), coalesce(c.text, '')), websearch_to_tsquery(cast(:language as regconfig), :query)) AS score
+                    FROM document_chunks c
+                    JOIN documents d ON c.document_id = d.id
+                    WHERE to_tsvector(cast(:language as regconfig), coalesce(c.text, '')) @@ websearch_to_tsquery(cast(:language as regconfig), :query)
+                      AND d.owner_id = :ownerId
+                    ORDER BY score DESC, c.id ASC
+                    LIMIT :limit
+                    """,
+            nativeQuery = true
+    )
+    List<ChunkKeywordMatch> searchKeywordByOwner(
+            @org.springframework.data.repository.query.Param("query") String query,
+            @org.springframework.data.repository.query.Param("language") String language,
+            @org.springframework.data.repository.query.Param("ownerId") Long ownerId,
+            @org.springframework.data.repository.query.Param("limit") int limit);
+
+    /**
+     * Executes cross-document PostgreSQL full-text search across all documents (ADMIN role).
+     *
+     * @param query    natural-language search query evaluated via websearch_to_tsquery
+     * @param language PostgreSQL FTS text search configuration (e.g. 'english')
+     * @param limit    maximum number of ranked candidates to return
+     * @return ranked keyword search matches ordered by ts_rank_cd DESC, chunkId ASC
+     */
+    @org.springframework.data.jpa.repository.Query(
+            value = """
+                    SELECT c.id AS chunkId,
+                           c.document_id AS documentId,
+                           ts_rank_cd(to_tsvector(cast(:language as regconfig), coalesce(c.text, '')), websearch_to_tsquery(cast(:language as regconfig), :query)) AS score
+                    FROM document_chunks c
+                    JOIN documents d ON c.document_id = d.id
+                    WHERE to_tsvector(cast(:language as regconfig), coalesce(c.text, '')) @@ websearch_to_tsquery(cast(:language as regconfig), :query)
+                    ORDER BY score DESC, c.id ASC
+                    LIMIT :limit
+                    """,
+            nativeQuery = true
+    )
+    List<ChunkKeywordMatch> searchKeywordAll(
+            @org.springframework.data.repository.query.Param("query") String query,
+            @org.springframework.data.repository.query.Param("language") String language,
+            @org.springframework.data.repository.query.Param("limit") int limit);
 }

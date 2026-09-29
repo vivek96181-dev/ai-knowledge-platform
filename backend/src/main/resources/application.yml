@@ -98,10 +98,25 @@ qdrant:
   use-tls: ${QDRANT_USE_TLS:false}
   api-key: ${QDRANT_API_KEY:}
 
-# Semantic Search configuration
+# Search configuration (Semantic, Keyword FTS, and Hybrid RRF)
 search:
   default-top-k: ${SEARCH_DEFAULT_TOP_K:5}
   max-top-k: ${SEARCH_MAX_TOP_K:20}
+  fts:
+    language: ${SEARCH_FTS_LANGUAGE:english}
+  hybrid:
+    enabled: ${SEARCH_HYBRID_ENABLED:true}
+    rrf-k: ${SEARCH_HYBRID_RRF_K:60}
+    semantic-weight: ${SEARCH_HYBRID_SEMANTIC_WEIGHT:1.0}
+    keyword-weight: ${SEARCH_HYBRID_KEYWORD_WEIGHT:1.0}
+    semantic-candidates: ${SEARCH_HYBRID_SEMANTIC_CANDIDATES:20}
+    keyword-candidates: ${SEARCH_HYBRID_KEYWORD_CANDIDATES:20}
+  reranking:
+    enabled: ${SEARCH_RERANKING_ENABLED:true}
+    candidate-count: ${SEARCH_RERANKING_CANDIDATE_COUNT:20}
+    model: ${SEARCH_RERANKING_MODEL:gemini-2.5-flash}
+    timeout-ms: ${SEARCH_RERANKING_TIMEOUT_MS:5000}
+    fallback-to-rrf: ${SEARCH_RERANKING_FALLBACK_TO_RRF:true}
 
 
 
