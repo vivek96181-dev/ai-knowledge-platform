@@ -15,12 +15,12 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * REST controller exposing document search APIs (Semantic Vector, Keyword FTS, and Hybrid RRF).
+ * REST controller exposing document search APIs (Semantic Vector, Keyword FTS, Hybrid RRF, and Relevance Reranking).
  *
  * <p><strong>Endpoints:</strong>
  * <ul>
- *   <li>{@code POST /api/search}: Unified search endpoint supporting {@code mode} (SEMANTIC, KEYWORD, HYBRID). Defaults to SEMANTIC.</li>
- *   <li>{@code POST /api/search/hybrid}: Direct convenience endpoint for hybrid RRF search.</li>
+ *   <li>{@code POST /api/search}: Unified search endpoint supporting {@code mode} (SEMANTIC, KEYWORD, HYBRID) and optional {@code rerank}. Defaults to SEMANTIC.</li>
+ *   <li>{@code POST /api/search/hybrid}: Direct convenience endpoint for hybrid RRF search with optional {@code rerank}.</li>
  * </ul>
  * </p>
  * <p><strong>Access:</strong> Authenticated users (USER or ADMIN).</p>
@@ -46,7 +46,7 @@ public class SearchController {
      * Executes a search query against the user's accessible documents.
      * Default mode is {@link SearchMode#SEMANTIC} for backward compatibility.
      *
-     * @param request        search request with query, optional topK, and optional mode
+     * @param request        search request with query, optional topK, optional mode, and optional rerank
      * @param authentication current user authentication principal
      * @return search response containing ranked relevant document chunks
      */
@@ -71,11 +71,12 @@ public class SearchController {
 
     /**
      * Dedicated endpoint for hybrid search fusing Qdrant semantic vector similarity
-     * and PostgreSQL lexical full-text search via Reciprocal Rank Fusion (RRF).
+     * and PostgreSQL lexical full-text search via Reciprocal Rank Fusion (RRF),
+     * with optional relevance reranking.
      *
-     * @param request        search request with natural language query and optional topK
+     * @param request        search request with natural language query, optional topK, and optional rerank
      * @param authentication current user authentication principal
-     * @return search response containing RRF-ranked relevant document chunks
+     * @return search response containing RRF-ranked or reranked relevant document chunks
      */
     @PostMapping("/hybrid")
     public ResponseEntity<SearchResponse> searchHybrid(

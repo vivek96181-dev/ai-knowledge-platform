@@ -94,7 +94,12 @@ search:
     keyword-weight: 1.0
     semantic-candidates: 20
     keyword-candidates: 20
-
+  reranking:
+    enabled: true
+    candidate-count: 20
+    model: gemini-2.5-flash
+    timeout-ms: 5000
+    fallback-to-rrf: true
 
 
 

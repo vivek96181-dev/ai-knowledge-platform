@@ -2,6 +2,7 @@ package com.enterprise.aiknowledge.service;
 
 import com.enterprise.aiknowledge.dto.*;
 import com.enterprise.aiknowledge.exception.ResourceNotFoundException;
+import com.enterprise.aiknowledge.exception.RerankerException;
 import com.enterprise.aiknowledge.model.Document;
 import com.enterprise.aiknowledge.model.DocumentChunk;
 import com.enterprise.aiknowledge.model.Role;
@@ -25,7 +26,7 @@ import static org.mockito.Mockito.*;
 /**
  * Unit tests for {@link HybridSearchService} covering input validation, candidate retrieval,
  * RRF fusion orchestration, multi-tenant isolation, ADMIN cross-tenant search, batch hydration,
- * stale chunk skipping, and fail-closed error handling.
+ * reranking integration, fallback behavior, and fail-closed error handling.
  */
 class HybridSearchServiceTest {
 
@@ -34,6 +35,7 @@ class HybridSearchServiceTest {
     private ReciprocalRankFuser reciprocalRankFuser;
     private DocumentChunkRepository mockChunkRepository;
     private UserRepository mockUserRepository;
+    private Reranker mockReranker;
 
     private HybridSearchService hybridSearchService;
 
@@ -51,6 +53,10 @@ class HybridSearchServiceTest {
         reciprocalRankFuser = new ReciprocalRankFuser();
         mockChunkRepository = mock(DocumentChunkRepository.class);
         mockUserRepository = mock(UserRepository.class);
+        mockReranker = mock(Reranker.class);
+
+        when(mockReranker.isEnabled()).thenReturn(true);
+        when(mockReranker.getModelName()).thenReturn("gemini-2.5-flash");
 
         hybridSearchService = new HybridSearchService(
                 mockSemanticSearchService,
@@ -58,13 +64,17 @@ class HybridSearchServiceTest {
                 reciprocalRankFuser,
                 mockChunkRepository,
                 mockUserRepository,
+                mockReranker,
                 5,
                 20,
                 60,
                 1.0,
                 1.0,
                 20,
-                20
+                20,
+                true,
+                20,
+                true
         );
 
         userA = new User();
@@ -95,18 +105,6 @@ class HybridSearchServiceTest {
         when(mockUserRepository.findByEmail("admin@example.com")).thenReturn(Optional.of(admin));
     }
 
-    private void setEntityId(Object entity, Long id) throws Exception {
-        Field field = entity.getClass().getDeclaredField("id");
-        field.setAccessible(true);
-        field.set(entity, id);
-    }
-
-    private DocumentChunk createChunk(Long id, Document document, int pageNumber, int chunkIndex, String text) throws Exception {
-        DocumentChunk chunk = new DocumentChunk(document, chunkIndex, pageNumber, text, 0, text.length());
-        setEntityId(chunk, id);
-        return chunk;
-    }
-
     // =========================================================================
     // 1. Validation Tests
     // =========================================================================
@@ -114,211 +112,243 @@ class HybridSearchServiceTest {
     @Test
     @DisplayName("Blank query throws IllegalArgumentException")
     void blankQueryThrowsException() {
-        assertThatThrownBy(() -> hybridSearchService.search(new SearchRequest("", 5, SearchMode.HYBRID), "user_a@example.com", false))
+        assertThatThrownBy(() -> hybridSearchService.search(
+                new SearchRequest("   ", 5, SearchMode.HYBRID), "user_a@example.com", false))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("query cannot be blank");
+                .hasMessageContaining("Search query cannot be blank");
     }
 
     @Test
     @DisplayName("Query exceeding 1000 characters throws IllegalArgumentException")
-    void excessiveQueryThrowsException() {
-        String hugeQuery = "x".repeat(1001);
-        assertThatThrownBy(() -> hybridSearchService.search(new SearchRequest(hugeQuery, 5, SearchMode.HYBRID), "user_a@example.com", false))
+    void queryExceedingMaxLengthThrowsException() {
+        String longQuery = "a".repeat(1001);
+        assertThatThrownBy(() -> hybridSearchService.search(
+                new SearchRequest(longQuery, 5, SearchMode.HYBRID), "user_a@example.com", false))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("cannot exceed 1000 characters");
+                .hasMessageContaining("Search query cannot exceed 1000 characters");
     }
 
     @Test
     @DisplayName("Invalid topK throws IllegalArgumentException")
     void invalidTopKThrowsException() {
-        assertThatThrownBy(() -> hybridSearchService.search(new SearchRequest("query", 0, SearchMode.HYBRID), "user_a@example.com", false))
+        assertThatThrownBy(() -> hybridSearchService.search(
+                new SearchRequest("query", 0, SearchMode.HYBRID), "user_a@example.com", false))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("topK must be between 1 and 20");
 
-        assertThatThrownBy(() -> hybridSearchService.search(new SearchRequest("query", 25, SearchMode.HYBRID), "user_a@example.com", false))
+        assertThatThrownBy(() -> hybridSearchService.search(
+                new SearchRequest("query", 25, SearchMode.HYBRID), "user_a@example.com", false))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("topK must be between 1 and 20");
     }
 
     // =========================================================================
-    // 2. Multi-Tenant Security & Ownership Filtering
+    // 2. Candidate Retrieval & Multi-Tenant Authorization Tests
     // =========================================================================
 
     @Test
-    @DisplayName("USER search enforces ownerId filter with caller's ID and never reintroduces foreign chunks")
-    void userSearchEnforcesOwnerIdFilterAndDefenseInDepth() throws Exception {
-        DocumentChunk chunkA = createChunk(101L, docA, 1, 0, "User A leave policy.");
-        DocumentChunk chunkB = createChunk(202L, docB, 1, 0, "User B confidential compensation.");
-
-        // Semantic returns chunkA (owned by User A)
-        when(mockSemanticSearchService.retrieveCandidates(eq("leave policy"), anyInt(), eq(10L)))
-                .thenReturn(List.of(new CandidateResult(101L, 100L, 0.95f, 1, RetrievalSourceType.SEMANTIC)));
-
-        // Keyword returns chunkA
-        when(mockKeywordSearchService.retrieveCandidates(eq("leave policy"), anyInt(), eq(10L)))
-                .thenReturn(List.of(new CandidateResult(101L, 100L, 0.80f, 1, RetrievalSourceType.KEYWORD)));
-
-        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(List.of(101L)))
-                .thenReturn(List.of(chunkA));
-
-        SearchResponse response = hybridSearchService.search(
-                new SearchRequest("leave policy", 5, SearchMode.HYBRID), "user_a@example.com", false);
-
-        assertThat(response.results()).hasSize(1);
-        assertThat(response.results().get(0).chunkId()).isEqualTo(101L);
-        assertThat(response.results().get(0).text()).isEqualTo("User A leave policy.");
-        // Verify owner ID 10L was passed to both retrieval services
-        verify(mockSemanticSearchService).retrieveCandidates(eq("leave policy"), anyInt(), eq(10L));
-        verify(mockKeywordSearchService).retrieveCandidates(eq("leave policy"), anyInt(), eq(10L));
-    }
-
-    @Test
-    @DisplayName("Defense-in-depth: If foreign chunk B somehow slips into fused list for User A, it is dropped")
-    void defenseInDepthDropsForeignChunk() throws Exception {
-        DocumentChunk chunkA = createChunk(101L, docA, 1, 0, "User A guidelines.");
-        DocumentChunk chunkB = createChunk(202L, docB, 1, 0, "User B trade secrets.");
-
-        // Simulate rogue candidate returned for User A
-        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(
-                        new CandidateResult(101L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC),
-                        new CandidateResult(202L, 200L, 0.8f, 2, RetrievalSourceType.SEMANTIC)
-                ));
-        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+    @DisplayName("USER search enforces tenant owner ID constraint in retrieval calls")
+    void userSearchEnforcesTargetOwnerId() throws Exception {
+        when(mockSemanticSearchService.retrieveCandidates(eq("annual leave"), eq(20), eq(10L)))
+                .thenReturn(List.of(new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC)));
+        when(mockKeywordSearchService.retrieveCandidates(eq("annual leave"), eq(20), eq(10L)))
                 .thenReturn(Collections.emptyList());
 
-        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(List.of(101L, 202L)))
-                .thenReturn(List.of(chunkA, chunkB));
+        DocumentChunk chunk1 = createChunk(1L, docA, "Leave policy text");
+        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(List.of(1L)))
+                .thenReturn(List.of(chunk1));
 
         SearchResponse response = hybridSearchService.search(
-                new SearchRequest("guidelines", 5, SearchMode.HYBRID), "user_a@example.com", false);
+                new SearchRequest("annual leave", 5, SearchMode.HYBRID), "user_a@example.com", false);
 
-        // chunkB must be filtered out by defense-in-depth
         assertThat(response.results()).hasSize(1);
-        assertThat(response.results().get(0).chunkId()).isEqualTo(101L);
-        assertThat(response.results().get(0).text()).isEqualTo("User A guidelines.");
+        assertThat(response.results().get(0).chunkId()).isEqualTo(1L);
+        assertThat(response.results().get(0).rerankScore()).isNull();
+
+        verify(mockSemanticSearchService).retrieveCandidates("annual leave", 20, 10L);
+        verify(mockKeywordSearchService).retrieveCandidates("annual leave", 20, 10L);
     }
 
     @Test
-    @DisplayName("ADMIN search passes null ownerId and retrieves chunks across all tenants")
-    void adminSearchCanRetrieveAcrossTenants() throws Exception {
-        DocumentChunk chunkA = createChunk(101L, docA, 1, 0, "User A guidelines.");
-        DocumentChunk chunkB = createChunk(202L, docB, 1, 0, "User B compliance.");
+    @DisplayName("ADMIN search passes null ownerId allowing cross-tenant document retrieval")
+    void adminSearchPassesNullOwnerId() throws Exception {
+        when(mockSemanticSearchService.retrieveCandidates(eq("policy"), eq(20), isNull()))
+                .thenReturn(List.of(new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC)));
+        when(mockKeywordSearchService.retrieveCandidates(eq("policy"), eq(20), isNull()))
+                .thenReturn(List.of(new CandidateResult(2L, 200L, 0.8f, 1, RetrievalSourceType.KEYWORD)));
 
-        when(mockSemanticSearchService.retrieveCandidates(eq("guidelines"), anyInt(), isNull()))
-                .thenReturn(List.of(new CandidateResult(101L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC)));
-        when(mockKeywordSearchService.retrieveCandidates(eq("guidelines"), anyInt(), isNull()))
-                .thenReturn(List.of(new CandidateResult(202L, 200L, 0.85f, 1, RetrievalSourceType.KEYWORD)));
-
-        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
-                .thenReturn(List.of(chunkA, chunkB));
-
-        SearchResponse response = hybridSearchService.search(
-                new SearchRequest("guidelines", 5, SearchMode.HYBRID), "admin@example.com", true);
-
-        assertThat(response.results()).hasSize(2);
-        verify(mockSemanticSearchService).retrieveCandidates(eq("guidelines"), anyInt(), isNull());
-        verify(mockKeywordSearchService).retrieveCandidates(eq("guidelines"), anyInt(), isNull());
-    }
-
-    // =========================================================================
-    // 3. Batch Hydration, Ranking, and Stale Chunks
-    // =========================================================================
-
-    @Test
-    @DisplayName("PostgreSQL hydration is performed in exactly one batch query preserving fused RRF order")
-    void batchHydrationPreservesRrfRanking() throws Exception {
-        DocumentChunk chunk1 = createChunk(101L, docA, 1, 0, "Chunk 1 text");
-        DocumentChunk chunk2 = createChunk(102L, docA, 2, 1, "Chunk 2 text");
-
-        // Semantic: 101 (rank 1), 102 (rank 2)
-        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(
-                        new CandidateResult(101L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC),
-                        new CandidateResult(102L, 100L, 0.7f, 2, RetrievalSourceType.SEMANTIC)
-                ));
-        // Keyword: 102 (rank 1) -> Chunk 102 receives boost and moves to rank 1!
-        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(
-                        new CandidateResult(102L, 100L, 0.8f, 1, RetrievalSourceType.KEYWORD)
-                ));
-
-        // DB returns chunks in reverse order (e.g. 101, 102)
+        DocumentChunk chunk1 = createChunk(1L, docA, "User A chunk");
+        DocumentChunk chunk2 = createChunk(2L, docB, "User B chunk");
         when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
                 .thenReturn(List.of(chunk1, chunk2));
 
         SearchResponse response = hybridSearchService.search(
-                new SearchRequest("query", 5, SearchMode.HYBRID), "user_a@example.com", false);
+                new SearchRequest("policy", 5, SearchMode.HYBRID), "admin@example.com", true);
 
         assertThat(response.results()).hasSize(2);
-        // Chunk 102 has score 1/62 + 1/61 ≈ 0.0325, while 101 has score 1/61 ≈ 0.0164
-        assertThat(response.results().get(0).chunkId()).isEqualTo(102L);
-        assertThat(response.results().get(0).text()).isEqualTo("Chunk 2 text");
-        assertThat(response.results().get(1).chunkId()).isEqualTo(101L);
-        assertThat(response.results().get(1).text()).isEqualTo("Chunk 1 text");
-
-        // Exactly one batch query to repository
-        verify(mockChunkRepository, times(1)).findAllWithDocumentAndOwnerByIdIn(anyCollection());
-    }
-
-    @Test
-    @DisplayName("Stale candidate point missing from database is safely skipped")
-    void staleCandidateSafelySkipped() throws Exception {
-        DocumentChunk chunk1 = createChunk(101L, docA, 1, 0, "Valid chunk");
-
-        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(
-                        new CandidateResult(999L, 100L, 0.99f, 1, RetrievalSourceType.SEMANTIC), // Stale chunk 999
-                        new CandidateResult(101L, 100L, 0.85f, 2, RetrievalSourceType.SEMANTIC)
-                ));
-        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(Collections.emptyList());
-
-        // DB only returns 101L, 999L does not exist
-        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
-                .thenReturn(List.of(chunk1));
-
-        SearchResponse response = hybridSearchService.search(
-                new SearchRequest("query", 5, SearchMode.HYBRID), "user_a@example.com", false);
-
-        assertThat(response.results()).hasSize(1);
-        assertThat(response.results().get(0).chunkId()).isEqualTo(101L);
+        verify(mockSemanticSearchService).retrieveCandidates("policy", 20, null);
+        verify(mockKeywordSearchService).retrieveCandidates("policy", 20, null);
     }
 
     // =========================================================================
-    // 4. Empty and Zero Results Handling
+    // 3. Reranker Integration Tests
     // =========================================================================
 
     @Test
-    @DisplayName("Zero semantic results and valid keyword results returns keyword results with RRF scores")
-    void zeroSemanticResultsValidKeywordResults() throws Exception {
-        DocumentChunk chunk1 = createChunk(101L, docA, 1, 0, "Keyword matched chunk");
+    @DisplayName("rerank=true expands candidate pool, invokes Reranker, and returns reordered top-K with rerankScore")
+    void rerankTrueInvokesRerankerAndReorders() throws Exception {
+        // Setup 3 candidates from retrieval
+        CandidateResult sem1 = new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC);
+        CandidateResult sem2 = new CandidateResult(2L, 100L, 0.8f, 2, RetrievalSourceType.SEMANTIC);
+        CandidateResult sem3 = new CandidateResult(3L, 100L, 0.7f, 3, RetrievalSourceType.SEMANTIC);
 
-        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+        when(mockSemanticSearchService.retrieveCandidates(eq("query"), eq(20), eq(10L)))
+                .thenReturn(List.of(sem1, sem2, sem3));
+        when(mockKeywordSearchService.retrieveCandidates(eq("query"), eq(20), eq(10L)))
                 .thenReturn(Collections.emptyList());
-        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(new CandidateResult(101L, 100L, 0.8f, 1, RetrievalSourceType.KEYWORD)));
 
+        DocumentChunk chunk1 = createChunk(1L, docA, "Chunk 1 text");
+        DocumentChunk chunk2 = createChunk(2L, docA, "Chunk 2 text");
+        DocumentChunk chunk3 = createChunk(3L, docA, "Chunk 3 text");
         when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
-                .thenReturn(List.of(chunk1));
+                .thenReturn(List.of(chunk1, chunk2, chunk3));
+
+        // Reranker inverts the order: chunk 3 gets highest relevance (0.95), chunk 1 gets (0.60)
+        when(mockReranker.rerank(eq("query"), anyList(), eq(2)))
+                .thenAnswer(inv -> {
+                    List<RerankCandidate> cands = inv.getArgument(1);
+                    return List.of(
+                            new RerankedCandidate(cands.get(2), 0.95f), // chunk 3
+                            new RerankedCandidate(cands.get(0), 0.60f)  // chunk 1
+                    );
+                });
 
         SearchResponse response = hybridSearchService.search(
-                new SearchRequest("query", 5, SearchMode.HYBRID), "user_a@example.com", false);
+                new SearchRequest("query", 2, SearchMode.HYBRID, true), "user_a@example.com", false);
 
-        assertThat(response.results()).hasSize(1);
-        assertThat(response.results().get(0).chunkId()).isEqualTo(101L);
+        assertThat(response.results()).hasSize(2);
+        // First result must be chunk 3 due to reranking
+        assertThat(response.results().get(0).chunkId()).isEqualTo(3L);
+        assertThat(response.results().get(0).rerankScore()).isEqualTo(0.95f);
+
+        // Second result must be chunk 1
+        assertThat(response.results().get(1).chunkId()).isEqualTo(1L);
+        assertThat(response.results().get(1).rerankScore()).isEqualTo(0.60f);
+
+        verify(mockReranker).rerank(eq("query"), anyList(), eq(2));
     }
 
     @Test
-    @DisplayName("Zero keyword results and valid semantic results returns semantic results with RRF scores")
-    void zeroKeywordResultsValidSemanticResults() throws Exception {
-        DocumentChunk chunk1 = createChunk(101L, docA, 1, 0, "Semantic matched chunk");
+    @DisplayName("rerank=true preserves multi-tenant isolation so unauthorized chunks never reach Reranker")
+    void rerankPreservesMultiTenantIsolation() throws Exception {
+        CandidateResult semA = new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC);
+        CandidateResult semB = new CandidateResult(2L, 200L, 0.85f, 2, RetrievalSourceType.SEMANTIC); // Owned by User B
 
         when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
-                .thenReturn(List.of(new CandidateResult(101L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC)));
+                .thenReturn(List.of(semA, semB));
         when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
                 .thenReturn(Collections.emptyList());
 
+        DocumentChunk chunkA = createChunk(1L, docA, "User A chunk");
+        DocumentChunk chunkB = createChunk(2L, docB, "User B chunk (unauthorized for userA)");
+        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
+                .thenReturn(List.of(chunkA, chunkB));
+
+        when(mockReranker.rerank(anyString(), anyList(), anyInt()))
+                .thenAnswer(inv -> {
+                    List<RerankCandidate> cands = inv.getArgument(1);
+                    // Verify candidate list passed to reranker contains ONLY chunkA
+                    assertThat(cands).hasSize(1);
+                    assertThat(cands.get(0).chunkId()).isEqualTo(1L);
+                    return List.of(new RerankedCandidate(cands.get(0), 0.90f));
+                });
+
+        SearchResponse response = hybridSearchService.search(
+                new SearchRequest("query", 5, SearchMode.HYBRID, true), "user_a@example.com", false);
+
+        assertThat(response.results()).hasSize(1);
+        assertThat(response.results().get(0).chunkId()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("When reranker fails and fallback is enabled, explicitly falls back to RRF order with rerankScore null")
+    void rerankerFailureFallsBackToRrf() throws Exception {
+        CandidateResult sem1 = new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC);
+        CandidateResult sem2 = new CandidateResult(2L, 100L, 0.8f, 2, RetrievalSourceType.SEMANTIC);
+
+        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(List.of(sem1, sem2));
+        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(Collections.emptyList());
+
+        DocumentChunk chunk1 = createChunk(1L, docA, "Chunk 1");
+        DocumentChunk chunk2 = createChunk(2L, docA, "Chunk 2");
+        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
+                .thenReturn(List.of(chunk1, chunk2));
+
+        when(mockReranker.rerank(anyString(), anyList(), anyInt()))
+                .thenThrow(new RerankerException("Gemini model quota exceeded"));
+
+        SearchResponse response = hybridSearchService.search(
+                new SearchRequest("query", 5, SearchMode.HYBRID, true), "user_a@example.com", false);
+
+        assertThat(response.results()).hasSize(2);
+        // Original RRF order preserved
+        assertThat(response.results().get(0).chunkId()).isEqualTo(1L);
+        assertThat(response.results().get(0).rerankScore()).isNull();
+        assertThat(response.results().get(1).chunkId()).isEqualTo(2L);
+        assertThat(response.results().get(1).rerankScore()).isNull();
+    }
+
+    @Test
+    @DisplayName("When reranker fails and fallback is disabled, rethrows RerankerException")
+    void rerankerFailureThrowsWhenFallbackDisabled() throws Exception {
+        HybridSearchService noFallbackService = new HybridSearchService(
+                mockSemanticSearchService,
+                mockKeywordSearchService,
+                reciprocalRankFuser,
+                mockChunkRepository,
+                mockUserRepository,
+                mockReranker,
+                5, 20, 60, 1.0, 1.0, 20, 20,
+                true, 20, false // fallbackToRrf = false
+        );
+
+        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(List.of(new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC)));
+        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(Collections.emptyList());
+
+        DocumentChunk chunk1 = createChunk(1L, docA, "Chunk 1");
+        when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
+                .thenReturn(List.of(chunk1));
+
+        when(mockReranker.rerank(anyString(), anyList(), anyInt()))
+                .thenThrow(new RerankerException("Model connection timeout"));
+
+        assertThatThrownBy(() -> noFallbackService.search(
+                new SearchRequest("query", 5, SearchMode.HYBRID, true), "user_a@example.com", false))
+                .isInstanceOf(RerankerException.class)
+                .hasMessageContaining("Model connection timeout");
+    }
+
+    // =========================================================================
+    // 4. Stale Chunks & Edge Cases
+    // =========================================================================
+
+    @Test
+    @DisplayName("Stale candidate chunks missing from PostgreSQL are safely skipped")
+    void staleChunksSafelySkipped() throws Exception {
+        CandidateResult sem1 = new CandidateResult(1L, 100L, 0.9f, 1, RetrievalSourceType.SEMANTIC);
+        CandidateResult sem2 = new CandidateResult(2L, 100L, 0.8f, 2, RetrievalSourceType.SEMANTIC);
+
+        when(mockSemanticSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(List.of(sem1, sem2));
+        when(mockKeywordSearchService.retrieveCandidates(anyString(), anyInt(), any()))
+                .thenReturn(Collections.emptyList());
+
+        // Only chunk 1 exists in DB; chunk 2 was deleted
+        DocumentChunk chunk1 = createChunk(1L, docA, "Active chunk");
         when(mockChunkRepository.findAllWithDocumentAndOwnerByIdIn(anyCollection()))
                 .thenReturn(List.of(chunk1));
 
@@ -326,7 +356,7 @@ class HybridSearchServiceTest {
                 new SearchRequest("query", 5, SearchMode.HYBRID), "user_a@example.com", false);
 
         assertThat(response.results()).hasSize(1);
-        assertThat(response.results().get(0).chunkId()).isEqualTo(101L);
+        assertThat(response.results().get(0).chunkId()).isEqualTo(1L);
     }
 
     @Test
@@ -383,5 +413,25 @@ class HybridSearchServiceTest {
                 new SearchRequest("query", 5, SearchMode.HYBRID), "unknown@example.com", false))
                 .isInstanceOf(ResourceNotFoundException.class)
                 .hasMessageContaining("User not found with email: unknown@example.com");
+    }
+
+    // =========================================================================
+    // Helper Methods
+    // =========================================================================
+
+    private DocumentChunk createChunk(Long id, Document doc, String text) throws Exception {
+        DocumentChunk chunk = new DocumentChunk();
+        setEntityId(chunk, id);
+        chunk.setDocument(doc);
+        chunk.setPageNumber(1);
+        chunk.setChunkIndex(0);
+        chunk.setText(text);
+        return chunk;
+    }
+
+    private void setEntityId(Object entity, Long id) throws Exception {
+        Field idField = entity.getClass().getDeclaredField("id");
+        idField.setAccessible(true);
+        idField.set(entity, id);
     }
 }

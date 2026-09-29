@@ -2,6 +2,7 @@ package com.enterprise.aiknowledge.service;
 
 import com.enterprise.aiknowledge.dto.*;
 import com.enterprise.aiknowledge.exception.ResourceNotFoundException;
+import com.enterprise.aiknowledge.exception.RerankerException;
 import com.enterprise.aiknowledge.model.DocumentChunk;
 import com.enterprise.aiknowledge.model.User;
 import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
@@ -18,19 +19,17 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * Service orchestrating Hybrid Search combining dense vector retrieval (Qdrant)
- * and lexical full-text retrieval (PostgreSQL FTS) using Reciprocal Rank Fusion (RRF).
+ * Orchestrator service implementing Hybrid Search with optional relevance Reranking.
  *
- * <p><strong>Retrieval Architecture:</strong>
+ * <p><strong>Pipeline Execution Steps:</strong>
  * <ol>
- *   <li>Validate request parameters (query non-blank, max 1000 chars, topK bounds).</li>
- *   <li>Resolve authenticated user identity and enforce multi-tenant isolation.</li>
  *   <li>Retrieve bounded semantic candidates from {@link SemanticSearchService}.</li>
  *   <li>Retrieve bounded lexical candidates from {@link KeywordSearchService}.</li>
- *   <li>Fuse and re-rank both candidate sets using {@link ReciprocalRankFuser} (RRF).</li>
- *   <li>Batch-hydrate top-K document chunk entities from PostgreSQL (eliminating N+1 queries).</li>
- *   <li>Enforce defense-in-depth server-side ownership checks and skip stale chunk points.</li>
- *   <li>Return {@link SearchResponse} preserving fused ranking order with fused RRF scores.</li>
+ *   <li>Fuse both candidate sets using {@link ReciprocalRankFuser} (RRF).</li>
+ *   <li>Batch-hydrate document chunk entities from PostgreSQL (zero N+1 queries).</li>
+ *   <li>Enforce defense-in-depth server-side ownership checks.</li>
+ *   <li>If reranking requested, score authorized candidates via {@link Reranker} and sort by relevance.</li>
+ *   <li>Return {@link SearchResponse} containing ranked results with both RRF and reranker scores.</li>
  * </ol>
  * </p>
  */
@@ -44,6 +43,7 @@ public class HybridSearchService {
     private final ReciprocalRankFuser reciprocalRankFuser;
     private final DocumentChunkRepository documentChunkRepository;
     private final UserRepository userRepository;
+    private final Reranker reranker;
 
     private final int defaultTopK;
     private final int maxTopK;
@@ -53,6 +53,10 @@ public class HybridSearchService {
     private final int semanticCandidatesLimit;
     private final int keywordCandidatesLimit;
 
+    private final boolean rerankingEnabled;
+    private final int rerankCandidateCount;
+    private final boolean fallbackToRrf;
+
     @Autowired
     public HybridSearchService(
             SemanticSearchService semanticSearchService,
@@ -60,18 +64,23 @@ public class HybridSearchService {
             ReciprocalRankFuser reciprocalRankFuser,
             DocumentChunkRepository documentChunkRepository,
             UserRepository userRepository,
+            Reranker reranker,
             @Value("${search.default-top-k:5}") int defaultTopK,
             @Value("${search.max-top-k:20}") int maxTopK,
             @Value("${search.hybrid.rrf-k:60}") int rrfK,
             @Value("${search.hybrid.semantic-weight:1.0}") double semanticWeight,
             @Value("${search.hybrid.keyword-weight:1.0}") double keywordWeight,
             @Value("${search.hybrid.semantic-candidates:20}") int semanticCandidatesLimit,
-            @Value("${search.hybrid.keyword-candidates:20}") int keywordCandidatesLimit) {
+            @Value("${search.hybrid.keyword-candidates:20}") int keywordCandidatesLimit,
+            @Value("${search.reranking.enabled:true}") boolean rerankingEnabled,
+            @Value("${search.reranking.candidate-count:20}") int rerankCandidateCount,
+            @Value("${search.reranking.fallback-to-rrf:true}") boolean fallbackToRrf) {
         this.semanticSearchService = semanticSearchService;
         this.keywordSearchService = keywordSearchService;
         this.reciprocalRankFuser = reciprocalRankFuser;
         this.documentChunkRepository = documentChunkRepository;
         this.userRepository = userRepository;
+        this.reranker = reranker;
         this.defaultTopK = defaultTopK;
         this.maxTopK = maxTopK;
         this.rrfK = rrfK;
@@ -79,15 +88,19 @@ public class HybridSearchService {
         this.keywordWeight = keywordWeight;
         this.semanticCandidatesLimit = semanticCandidatesLimit;
         this.keywordCandidatesLimit = keywordCandidatesLimit;
+        this.rerankingEnabled = rerankingEnabled;
+        this.rerankCandidateCount = rerankCandidateCount;
+        this.fallbackToRrf = fallbackToRrf;
     }
 
     /**
-     * Executes hybrid search combining Qdrant vector retrieval and PostgreSQL full-text search.
+     * Executes hybrid search combining Qdrant vector retrieval, PostgreSQL full-text search,
+     * and optional query-to-chunk relevance reranking.
      *
-     * @param request          search request containing query and optional topK
+     * @param request          search request containing query, optional topK, and optional rerank flag
      * @param currentUserEmail email of the authenticated principal from JWT
      * @param isAdmin          whether the authenticated user has ROLE_ADMIN
-     * @return search response containing RRF-ranked relevant document chunks
+     * @return search response containing ranked relevant document chunks
      */
     @Transactional(readOnly = true)
     public SearchResponse search(SearchRequest request, String currentUserEmail, boolean isAdmin) {
@@ -107,20 +120,27 @@ public class HybridSearchService {
                     "topK must be between 1 and %d, but was: %d", maxTopK, resolvedTopK));
         }
 
+        // Determine if reranking should be performed
+        boolean shouldRerank = Boolean.TRUE.equals(request.rerank())
+                && rerankingEnabled
+                && reranker != null
+                && reranker.isEnabled();
+
         // Step 2: Resolve user identity
         User currentUser = userRepository.findByEmail(currentUserEmail)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + currentUserEmail));
 
         Long targetOwnerId = isAdmin ? null : currentUser.getId();
 
-        log.info("Executing hybrid search (user: {}, role: {}, targetOwnerId: {}, topK: {})",
-                currentUserEmail, isAdmin ? "ADMIN" : "USER", targetOwnerId, resolvedTopK);
+        log.info("Executing hybrid search (user: {}, role: {}, targetOwnerId: {}, topK: {}, rerank: {})",
+                currentUserEmail, isAdmin ? "ADMIN" : "USER", targetOwnerId, resolvedTopK, shouldRerank);
 
-        // Step 3 & 4: Retrieve bounded candidates from both retrieval subsystems
-        int semLimit = Math.max(resolvedTopK, semanticCandidatesLimit);
-        int kwLimit = Math.max(resolvedTopK, keywordCandidatesLimit);
+        // Step 3: Determine candidate bounds
+        int fusionTargetCount = shouldRerank ? Math.max(resolvedTopK, rerankCandidateCount) : resolvedTopK;
+        int semLimit = Math.max(fusionTargetCount, semanticCandidatesLimit);
+        int kwLimit = Math.max(fusionTargetCount, keywordCandidatesLimit);
 
-        // Fail-closed design: underlying exceptions propagate naturally to prevent degraded or false results
+        // Step 4: Retrieve bounded candidates from both retrieval subsystems
         List<CandidateResult> semanticCandidates = semanticSearchService.retrieveCandidates(trimmedQuery, semLimit, targetOwnerId);
         List<CandidateResult> keywordCandidates = keywordSearchService.retrieveCandidates(trimmedQuery, kwLimit, targetOwnerId);
 
@@ -135,7 +155,7 @@ public class HybridSearchService {
                 rrfK,
                 semanticWeight,
                 keywordWeight,
-                resolvedTopK
+                fusionTargetCount
         );
 
         if (fusedCandidates.isEmpty()) {
@@ -152,12 +172,11 @@ public class HybridSearchService {
         Map<Long, DocumentChunk> chunkMap = chunks.stream()
                 .collect(Collectors.toMap(DocumentChunk::getId, Function.identity()));
 
-        // Step 7: Assemble results preserving RRF score ranking order
-        List<SearchResult> results = new ArrayList<>(fusedCandidates.size());
+        // Step 7: Filter authorized candidates
+        List<RerankCandidate> authorizedCandidates = new ArrayList<>();
         for (ReciprocalRankFuser.FusedCandidate fused : fusedCandidates) {
             DocumentChunk chunk = chunkMap.get(fused.chunkId());
 
-            // Handle stale candidates missing from database
             if (chunk == null) {
                 log.warn("Stale candidate point detected: chunk ID {} not found in database. Safely skipping.",
                         fused.chunkId());
@@ -171,9 +190,9 @@ public class HybridSearchService {
                 continue;
             }
 
-            results.add(new SearchResult(
-                    chunk.getDocument().getId(),
+            authorizedCandidates.add(new RerankCandidate(
                     chunk.getId(),
+                    chunk.getDocument().getId(),
                     chunk.getPageNumber(),
                     chunk.getChunkIndex(),
                     fused.fusedScore(),
@@ -181,8 +200,65 @@ public class HybridSearchService {
             ));
         }
 
-        log.info("Hybrid search completed: {} fused candidates -> {} final hydrated results",
-                fusedCandidates.size(), results.size());
+        // Step 8: Apply Reranker if requested, or assemble standard RRF results
+        List<SearchResult> results = new ArrayList<>();
+
+        if (shouldRerank && !authorizedCandidates.isEmpty()) {
+            try {
+                List<RerankedCandidate> reranked = reranker.rerank(trimmedQuery, authorizedCandidates, resolvedTopK);
+                for (RerankedCandidate rc : reranked) {
+                    RerankCandidate c = rc.candidate();
+                    results.add(new SearchResult(
+                            c.documentId(),
+                            c.chunkId(),
+                            c.pageNumber(),
+                            c.chunkIndex(),
+                            c.rrfScore(),
+                            c.text(),
+                            rc.rerankScore()
+                    ));
+                }
+                log.info("Hybrid search with reranking completed: {} candidates -> {} final results",
+                        authorizedCandidates.size(), results.size());
+            } catch (Exception e) {
+                if (fallbackToRrf) {
+                    log.warn("Reranking failed for query ({}). Explicitly falling back to RRF candidate ranking without rerank scores.",
+                            e.getMessage());
+                    // Fall back explicitly to pre-reranked RRF order truncated to topK
+                    int fallbackLimit = Math.min(resolvedTopK, authorizedCandidates.size());
+                    for (int i = 0; i < fallbackLimit; i++) {
+                        RerankCandidate c = authorizedCandidates.get(i);
+                        results.add(new SearchResult(
+                                c.documentId(),
+                                c.chunkId(),
+                                c.pageNumber(),
+                                c.chunkIndex(),
+                                c.rrfScore(),
+                                c.text(),
+                                null // rerankScore is explicitly null to signify fallback
+                        ));
+                    }
+                } else {
+                    throw new RerankerException("Reranker failed and fallback is disabled: " + e.getMessage(), e);
+                }
+            }
+        } else {
+            // Standard un-reranked RRF path
+            int finalLimit = Math.min(resolvedTopK, authorizedCandidates.size());
+            for (int i = 0; i < finalLimit; i++) {
+                RerankCandidate c = authorizedCandidates.get(i);
+                results.add(new SearchResult(
+                        c.documentId(),
+                        c.chunkId(),
+                        c.pageNumber(),
+                        c.chunkIndex(),
+                        c.rrfScore(),
+                        c.text()
+                ));
+            }
+            log.info("Standard hybrid search completed: {} fused candidates -> {} final results",
+                    authorizedCandidates.size(), results.size());
+        }
 
         return new SearchResponse(trimmedQuery, results);
     }
@@ -205,5 +281,17 @@ public class HybridSearchService {
 
     public double getKeywordWeight() {
         return keywordWeight;
+    }
+
+    public boolean isRerankingEnabled() {
+        return rerankingEnabled;
+    }
+
+    public int getRerankCandidateCount() {
+        return rerankCandidateCount;
+    }
+
+    public boolean isFallbackToRrf() {
+        return fallbackToRrf;
     }
 }

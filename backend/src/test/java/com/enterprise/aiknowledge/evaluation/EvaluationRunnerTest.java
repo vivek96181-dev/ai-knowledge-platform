@@ -34,6 +34,9 @@ class EvaluationRunnerTest {
     @Mock
     private RagService ragService;
 
+    @Mock
+    private com.enterprise.aiknowledge.service.HybridSearchService hybridSearchService;
+
     private EvaluationRunner runner;
 
     @BeforeEach
@@ -47,7 +50,8 @@ class EvaluationRunnerTest {
                 ragService,
                 retrievalEvaluator,
                 answerEvaluator,
-                datasetLoader
+                datasetLoader,
+                hybridSearchService
         );
     }
 
@@ -207,5 +211,56 @@ class EvaluationRunnerTest {
         assertNotNull(summary);
         assertEquals("rag-baseline-v1", summary.datasetName());
         assertEquals(7, summary.totalCases());
+    }
+
+    @Test
+    @DisplayName("compareHybridVsReranked evaluates baseline and reranked metrics side-by-side")
+    void compareHybridVsReranked_computesComparisonReport() {
+        EvaluationCase testCase = new EvaluationCase(
+                "case-1",
+                "What is the leave policy?",
+                List.of(101L, 102L),
+                List.of(10L),
+                "Leave policy reference",
+                List.of("leave"),
+                false,
+                "user@example.com",
+                false
+        );
+
+        EvaluationDataset dataset = new EvaluationDataset(
+                "compare-dataset",
+                "1.0.0",
+                "Comparison test dataset",
+                List.of(testCase)
+        );
+
+        // Baseline (rerank=false): returns chunk 102 first, then 101
+        when(hybridSearchService.search(
+                argThat(req -> req != null && Boolean.FALSE.equals(req.rerank())),
+                eq("user@example.com"),
+                eq(false)
+        )).thenReturn(new SearchResponse("What is the leave policy?", List.of(
+                new SearchResult(10L, 102L, 2, 1, 0.03f, "Chunk 102 text"),
+                new SearchResult(10L, 101L, 1, 0, 0.02f, "Chunk 101 text")
+        )));
+
+        // Experiment (rerank=true): returns chunk 101 first, then 102
+        when(hybridSearchService.search(
+                argThat(req -> req != null && Boolean.TRUE.equals(req.rerank())),
+                eq("user@example.com"),
+                eq(false)
+        )).thenReturn(new SearchResponse("What is the leave policy?", List.of(
+                new SearchResult(10L, 101L, 1, 0, 0.02f, "Chunk 101 text", 0.95f),
+                new SearchResult(10L, 102L, 2, 1, 0.03f, "Chunk 102 text", 0.80f)
+        )));
+
+        var comparison = runner.compareHybridVsReranked(dataset, 5);
+
+        assertNotNull(comparison);
+        assertEquals("compare-dataset", comparison.datasetName());
+        assertEquals(1, comparison.totalQueries());
+        assertNotNull(comparison.formattedReport());
+        assertTrue(comparison.formattedReport().contains("HYBRID vs HYBRID+RERANKING"));
     }
 }

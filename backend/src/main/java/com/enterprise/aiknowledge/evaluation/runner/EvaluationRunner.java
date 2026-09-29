@@ -4,6 +4,7 @@ import com.enterprise.aiknowledge.dto.*;
 import com.enterprise.aiknowledge.evaluation.evaluator.AnswerEvaluator;
 import com.enterprise.aiknowledge.evaluation.evaluator.RetrievalEvaluator;
 import com.enterprise.aiknowledge.evaluation.model.*;
+import com.enterprise.aiknowledge.service.HybridSearchService;
 import com.enterprise.aiknowledge.service.RagService;
 import com.enterprise.aiknowledge.service.SearchService;
 import org.slf4j.Logger;
@@ -27,6 +28,7 @@ public class EvaluationRunner {
     private final RetrievalEvaluator retrievalEvaluator;
     private final AnswerEvaluator answerEvaluator;
     private final EvaluationDatasetLoader datasetLoader;
+    private final HybridSearchService hybridSearchService;
 
     @Autowired
     public EvaluationRunner(
@@ -34,12 +36,26 @@ public class EvaluationRunner {
             RagService ragService,
             RetrievalEvaluator retrievalEvaluator,
             AnswerEvaluator answerEvaluator,
-            EvaluationDatasetLoader datasetLoader) {
+            EvaluationDatasetLoader datasetLoader,
+            @Autowired(required = false) HybridSearchService hybridSearchService) {
         this.searchService = searchService;
         this.ragService = ragService;
         this.retrievalEvaluator = retrievalEvaluator;
         this.answerEvaluator = answerEvaluator;
         this.datasetLoader = datasetLoader;
+        this.hybridSearchService = hybridSearchService;
+    }
+
+    /**
+     * Backward-compatible constructor for unit testing.
+     */
+    public EvaluationRunner(
+            SearchService searchService,
+            RagService ragService,
+            RetrievalEvaluator retrievalEvaluator,
+            AnswerEvaluator answerEvaluator,
+            EvaluationDatasetLoader datasetLoader) {
+        this(searchService, ragService, retrievalEvaluator, answerEvaluator, datasetLoader, null);
     }
 
     /**
@@ -133,6 +149,129 @@ public class EvaluationRunner {
         log.info("{}", summary.toFormattedReport());
 
         return summary;
+    }
+
+    /**
+     * Executes side-by-side retrieval evaluation comparing Baseline (Hybrid Search without Reranking)
+     * versus Experiment (Hybrid Search with Reranking).
+     *
+     * @param dataset dataset containing evaluation cases
+     * @param topK    number of top documents to retrieve
+     * @return comparison summary containing baseline and experimental metrics
+     */
+    public RetrievalComparisonSummary compareHybridVsReranked(EvaluationDataset dataset, int topK) {
+        if (hybridSearchService == null) {
+            throw new IllegalStateException("HybridSearchService is required for hybrid vs reranking evaluation");
+        }
+        if (dataset == null || dataset.cases().isEmpty()) {
+            throw new IllegalArgumentException("Evaluation dataset cannot be null or empty");
+        }
+
+        log.info("Starting Hybrid vs Reranking evaluation for dataset '{}' ({} cases, topK: {})",
+                dataset.name(), dataset.cases().size(), topK);
+
+        List<RetrievalMetrics> baselineMetricsList = new ArrayList<>();
+        List<RetrievalMetrics> rerankedMetricsList = new ArrayList<>();
+
+        for (EvaluationCase testCase : dataset.cases()) {
+            // 1. Baseline: Hybrid Search without reranking
+            SearchRequest baselineRequest = new SearchRequest(testCase.question(), topK, SearchMode.HYBRID, false);
+            SearchResponse baselineResponse = hybridSearchService.search(
+                    baselineRequest,
+                    testCase.userEmail(),
+                    testCase.isAdmin()
+            );
+            List<Long> baselineIds = baselineResponse.results() != null
+                    ? baselineResponse.results().stream().map(SearchResult::chunkId).toList()
+                    : Collections.emptyList();
+            baselineMetricsList.add(retrievalEvaluator.evaluate(baselineIds, testCase.expectedChunkIds()));
+
+            // 2. Experiment: Hybrid Search WITH reranking
+            SearchRequest rerankedRequest = new SearchRequest(testCase.question(), topK, SearchMode.HYBRID, true);
+            SearchResponse rerankedResponse = hybridSearchService.search(
+                    rerankedRequest,
+                    testCase.userEmail(),
+                    testCase.isAdmin()
+            );
+            List<Long> rerankedIds = rerankedResponse.results() != null
+                    ? rerankedResponse.results().stream().map(SearchResult::chunkId).toList()
+                    : Collections.emptyList();
+            rerankedMetricsList.add(retrievalEvaluator.evaluate(rerankedIds, testCase.expectedChunkIds()));
+        }
+
+        int totalCases = dataset.cases().size();
+        Set<Integer> kValues = baselineMetricsList.get(0).recallAtK().keySet();
+
+        Map<Integer, Double> meanRecallBaseline = new LinkedHashMap<>();
+        Map<Integer, Double> meanRecallReranked = new LinkedHashMap<>();
+        Map<Integer, Double> meanPrecBaseline = new LinkedHashMap<>();
+        Map<Integer, Double> meanPrecReranked = new LinkedHashMap<>();
+
+        for (int k : kValues) {
+            meanRecallBaseline.put(k, baselineMetricsList.stream().mapToDouble(m -> m.recallAtK().getOrDefault(k, 0.0)).sum() / totalCases);
+            meanRecallReranked.put(k, rerankedMetricsList.stream().mapToDouble(m -> m.recallAtK().getOrDefault(k, 0.0)).sum() / totalCases);
+            meanPrecBaseline.put(k, baselineMetricsList.stream().mapToDouble(m -> m.precisionAtK().getOrDefault(k, 0.0)).sum() / totalCases);
+            meanPrecReranked.put(k, rerankedMetricsList.stream().mapToDouble(m -> m.precisionAtK().getOrDefault(k, 0.0)).sum() / totalCases);
+        }
+
+        double mrrBaseline = baselineMetricsList.stream().mapToDouble(RetrievalMetrics::reciprocalRank).sum() / totalCases;
+        double mrrReranked = rerankedMetricsList.stream().mapToDouble(RetrievalMetrics::reciprocalRank).sum() / totalCases;
+
+        String report = formatComparisonReport(
+                dataset.name(),
+                totalCases,
+                meanRecallBaseline,
+                meanRecallReranked,
+                meanPrecBaseline,
+                meanPrecReranked,
+                mrrBaseline,
+                mrrReranked
+        );
+
+        log.info("{}", report);
+
+        return new RetrievalComparisonSummary(
+                dataset.name(),
+                totalCases,
+                meanRecallBaseline,
+                meanRecallReranked,
+                meanPrecBaseline,
+                meanPrecReranked,
+                mrrBaseline,
+                mrrReranked,
+                report
+        );
+    }
+
+    private String formatComparisonReport(
+            String datasetName,
+            int totalCases,
+            Map<Integer, Double> recallBase,
+            Map<Integer, Double> recallRerank,
+            Map<Integer, Double> precBase,
+            Map<Integer, Double> precRerank,
+            double mrrBase,
+            double mrrRerank) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n=======================================================\n");
+        sb.append("RETRIEVAL EVALUATION COMPARISON: HYBRID vs HYBRID+RERANKING\n");
+        sb.append(String.format("Dataset: %s | Total Queries: %d\n", datasetName, totalCases));
+        sb.append("-------------------------------------------------------\n");
+        sb.append(String.format("%-15s | %-16s | %-16s\n", "Metric", "Hybrid (Baseline)", "Hybrid + Rerank"));
+        sb.append("-------------------------------------------------------\n");
+
+        for (Integer k : recallBase.keySet()) {
+            sb.append(String.format("Recall@%-9d | %-16.4f | %-16.4f\n",
+                    k, recallBase.getOrDefault(k, 0.0), recallRerank.getOrDefault(k, 0.0)));
+        }
+        for (Integer k : precBase.keySet()) {
+            sb.append(String.format("Precision@%-6d | %-16.4f | %-16.4f\n",
+                    k, precBase.getOrDefault(k, 0.0), precRerank.getOrDefault(k, 0.0)));
+        }
+        sb.append(String.format("%-15s | %-16.4f | %-16.4f\n", "MRR", mrrBase, mrrRerank));
+        sb.append("=======================================================\n");
+
+        return sb.toString();
     }
 
     /**

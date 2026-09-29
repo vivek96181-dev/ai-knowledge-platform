@@ -19,6 +19,7 @@ import com.enterprise.aiknowledge.repository.UserRepository;
 import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.KeywordSearchService;
 import com.enterprise.aiknowledge.service.PasswordHashingService;
+import com.enterprise.aiknowledge.service.Reranker;
 import com.enterprise.aiknowledge.service.ScoredChunkDto;
 import com.enterprise.aiknowledge.service.VectorStoreService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -71,6 +72,7 @@ class SearchControllerTest {
     @MockBean private EmbeddingService embeddingService;
     @MockBean private VectorStoreService vectorStoreService;
     @MockBean private KeywordSearchService keywordSearchService;
+    @MockBean private Reranker reranker;
 
     private static final String SEARCH_URL = "/api/search";
     private static final String USER_A_EMAIL = "user_a@example.com";
@@ -93,6 +95,7 @@ class SearchControllerTest {
         userRepository.deleteAll();
 
         when(embeddingService.generateEmbedding(any())).thenReturn(mockVector);
+        when(reranker.isEnabled()).thenReturn(true);
 
         userA = new User();
         userA.setName("User A");
@@ -336,6 +339,69 @@ class SearchControllerTest {
                 .andExpect(jsonPath("$.query").value("hybrid test"))
                 .andExpect(jsonPath("$.results", hasSize(1)))
                 .andExpect(jsonPath("$.results[0].chunkId").value(chunkA.getId()));
+    }
+
+    @Test
+    @DisplayName("POST /api/search with mode=HYBRID and rerank=true returns reranked results with rerankScore")
+    void searchHybridWithRerankTrueWorks() throws Exception {
+        Document docA = createDocument(userA, "docA.pdf");
+        DocumentChunk chunkA = createChunk(docA, 1, 0, "Chunk text for reranking.");
+
+        when(vectorStoreService.search(anyList(), anyInt(), eq(userA.getId())))
+                .thenReturn(List.of(
+                        new ScoredChunkDto(chunkA.getId(), docA.getId(), 1, 0, userA.getId(), 0.85f)
+                ));
+        when(keywordSearchService.retrieveCandidates(anyString(), anyInt(), eq(userA.getId())))
+                .thenReturn(Collections.emptyList());
+
+        when(reranker.rerank(eq("rerank query"), anyList(), eq(5)))
+                .thenAnswer(inv -> {
+                    List<com.enterprise.aiknowledge.dto.RerankCandidate> cands = inv.getArgument(1);
+                    return List.of(new com.enterprise.aiknowledge.dto.RerankedCandidate(cands.get(0), 0.98f));
+                });
+
+        SearchRequest request = new SearchRequest("rerank query", 5, SearchMode.HYBRID, true);
+
+        mockMvc.perform(post(SEARCH_URL)
+                        .with(user(USER_A_EMAIL).roles("USER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.query").value("rerank query"))
+                .andExpect(jsonPath("$.results", hasSize(1)))
+                .andExpect(jsonPath("$.results[0].chunkId").value(chunkA.getId()))
+                .andExpect(jsonPath("$.results[0].rerankScore").value(0.98));
+    }
+
+    @Test
+    @DisplayName("POST /api/search/hybrid with rerank=true returns reranked results")
+    void dedicatedHybridEndpointWithRerankTrueWorks() throws Exception {
+        Document docA = createDocument(userA, "docA.pdf");
+        DocumentChunk chunkA = createChunk(docA, 1, 0, "Dedicated hybrid rerank chunk.");
+
+        when(vectorStoreService.search(anyList(), anyInt(), eq(userA.getId())))
+                .thenReturn(List.of(
+                        new ScoredChunkDto(chunkA.getId(), docA.getId(), 1, 0, userA.getId(), 0.80f)
+                ));
+        when(keywordSearchService.retrieveCandidates(anyString(), anyInt(), eq(userA.getId())))
+                .thenReturn(Collections.emptyList());
+
+        when(reranker.rerank(eq("dedicated hybrid rerank"), anyList(), eq(5)))
+                .thenAnswer(inv -> {
+                    List<com.enterprise.aiknowledge.dto.RerankCandidate> cands = inv.getArgument(1);
+                    return List.of(new com.enterprise.aiknowledge.dto.RerankedCandidate(cands.get(0), 0.94f));
+                });
+
+        SearchRequest request = new SearchRequest("dedicated hybrid rerank", 5, SearchMode.HYBRID, true);
+
+        mockMvc.perform(post("/api/search/hybrid")
+                        .with(user(USER_A_EMAIL).roles("USER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.query").value("dedicated hybrid rerank"))
+                .andExpect(jsonPath("$.results[0].chunkId").value(chunkA.getId()))
+                .andExpect(jsonPath("$.results[0].rerankScore").value(0.94));
     }
 
     @Test
