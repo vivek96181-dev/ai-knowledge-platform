@@ -38,6 +38,7 @@ public class DocumentService {
     private final FileStorageService fileStorageService;
     private final DocumentEventProducer documentEventProducer;
     private final VectorStoreService vectorStoreService;
+    private final CacheService cacheService;
 
     public DocumentService(
             DocumentRepository documentRepository,
@@ -47,7 +48,8 @@ public class DocumentService {
             UserRepository userRepository,
             FileStorageService fileStorageService,
             DocumentEventProducer documentEventProducer,
-            VectorStoreService vectorStoreService) {
+            VectorStoreService vectorStoreService,
+            CacheService cacheService) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -56,6 +58,7 @@ public class DocumentService {
         this.fileStorageService = fileStorageService;
         this.documentEventProducer = documentEventProducer;
         this.vectorStoreService = vectorStoreService;
+        this.cacheService = cacheService;
     }
 
     /**
@@ -207,6 +210,10 @@ public class DocumentService {
 
         // Delete metadata row from database
         documentRepository.delete(document);
+
+        // Invalidate cached search/RAG results for the document owner (and ADMIN namespace)
+        Long ownerId = document.getOwner().getId();
+        cacheService.evictByDocumentOwner(ownerId);
     }
 
     private DocumentResponse mapToResponse(Document document) {

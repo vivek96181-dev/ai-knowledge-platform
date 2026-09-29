@@ -97,6 +97,16 @@ Spring Boot 3 backend service for the Enterprise AI Knowledge Platform.
 - Evaluation comparison framework (`compareHybridVsReranked`) measuring Recall@K, Precision@K, and MRR
 - 208 total automated unit, integration, and evaluation tests passing (100% offline via deterministic mocks)
 
+### Phase 13 — Redis Caching (Search & RAG Response Cache with Multi-Tenant Isolation)
+- Redis 7.4-alpine with persistent volume and AOF durability in Docker Compose
+- Spring Data Redis (Lettuce) with `StringRedisTemplate` and Jackson JSON serialization
+- Application-level `CacheService` abstraction with `RedisCacheService` (production) and `NoOpCacheService` (tests/disabled)
+- `CacheKeyFactory` producing deterministic, tenant-safe SHA-256 cache keys with user/admin scope isolation
+- Cache-aside pattern in `SearchController` and `RagController` with cache hits bypassing full search/RAG pipeline
+- Targeted cache invalidation on document delete and reprocessing (per-owner + ADMIN namespace)
+- Configurable TTL (search: 5min, RAG: 10min), key versioning (`v1`), and graceful Redis failure fallback
+- 265 total automated tests passing (57 new caching tests, all existing tests green)
+
 ---
 
 ## 1. Architecture & End-to-End Flow
@@ -1223,3 +1233,165 @@ The evaluation runner compares **Baseline (Hybrid Search)** against **Experiment
 - **Recall@1 (+42.8%) & Precision@1 (+200%):** The reranker consistently promotes the most relevant ground-truth chunk to rank #1, directly boosting single-chunk retrieval accuracy.
 - **MRR (+50%):** Mean Reciprocal Rank increases from 0.2857 to 0.4286, proving that relevant chunks appear substantially higher in the ranked list.
 - **Top-5 Recall (0.8571):** Preserved without degradation, demonstrating that the candidate pool of 20 adequately retains relevant candidates.
+
+---
+
+## Phase 13 — Redis Caching (Search & RAG Response Cache)
+
+Redis caching reduces redundant expensive retrieval and RAG work by caching the final authorized response after the full pipeline (embedding, vector search, keyword search, RRF fusion, reranking, PostgreSQL hydration, and/or LLM generation) completes. Caching is an optimization — Redis is never the source of truth, and the application functions identically if Redis is unavailable.
+
+### 1. Architecture
+
+```
+Authenticated Request
+             │
+             ▼
+   Resolve User Identity (from JWT principal)
+             │
+             ▼
+   Build Tenant-Safe Cache Key
+   (CacheKeyFactory + SHA-256)
+             │
+             ▼
+   Redis Lookup
+             │
+     ┌───────┴───────┐
+     ▼               ▼
+   HIT             MISS
+     │               │
+     ▼               ▼
+   Return         Existing Search/RAG Pipeline
+   Cached           (Embedding → Qdrant → FTS
+   Result            → RRF → Reranker → Hydration
+                     → RAG Generation)
+                     │
+                     ▼
+                   Store in Redis (with TTL)
+                     │
+                     ▼
+                   Return Result
+```
+
+### 2. Cache Key Design
+
+All cache keys are deterministic, tenant-safe, and versioned:
+
+```
+Search: search:{version}:user:{userId}:mode:{MODE}:topK:{N}:rerank:{bool}:q:{sha256}
+RAG:    rag:{version}:user:{userId}:topK:{N}:q:{sha256}
+
+ADMIN:  search:{version}:admin:all:mode:{MODE}:topK:{N}:rerank:{bool}:q:{sha256}
+        rag:{version}:admin:all:topK:{N}:q:{sha256}
+```
+
+| Component | Source | Purpose |
+|---|---|---|
+| `{version}` | `cache.key-version` config | Namespace versioning for model/config changes |
+| `user:{userId}` | Authenticated JWT principal | **Multi-tenant isolation** (never from request body) |
+| `admin:all` | JWT `ROLE_ADMIN` authority | Separate ADMIN namespace (cannot collide with USER keys) |
+| `{MODE}` | `SearchMode` enum | Distinguishes SEMANTIC, KEYWORD, HYBRID results |
+| `{N}` | Resolved topK | Different result set sizes get separate entries |
+| `{bool}` | rerank flag | Reranked vs un-reranked results are distinct |
+| `{sha256}` | SHA-256 of normalized query | Fixed-length, deterministic, collision-resistant query hash |
+
+**Query Normalization:** Before hashing, queries are trimmed, collapsed to single spaces, and lowercased. This ensures `"  What  is   AI? "` and `"what is ai?"` produce identical cache keys.
+
+### 3. Security Guarantees
+
+- **User A’s cached result is NEVER returned to User B.** Cache keys embed the authenticated user’s database ID derived from the JWT principal.
+- **ADMIN and USER namespaces cannot collide.** ADMIN uses `admin:all` scope; USER uses `user:{id}` scope.
+- **Only authorized, final responses are cached.** Raw Qdrant results, unauthorized candidates, JPA entities, JWTs, and API keys are never cached.
+- **Redis failures never expose cached data.** On read failure, the cache returns empty and the full pipeline executes.
+
+### 4. Configuration
+
+```yaml
+# Redis connection
+spring.data.redis:
+  host: ${REDIS_HOST:localhost}
+  port: ${REDIS_PORT:6379}
+
+# Cache configuration
+cache:
+  enabled: ${CACHE_ENABLED:true}
+  key-version: ${CACHE_KEY_VERSION:v1}
+  search:
+    ttl-seconds: ${CACHE_SEARCH_TTL_SECONDS:300}   # 5 minutes
+  rag:
+    ttl-seconds: ${CACHE_RAG_TTL_SECONDS:600}       # 10 minutes
+```
+
+| Property | Environment Variable | Default | Description |
+|---|---|---|---|
+| `cache.enabled` | `CACHE_ENABLED` | `true` | Feature toggle for Redis caching |
+| `cache.key-version` | `CACHE_KEY_VERSION` | `v1` | Cache namespace version (increment on model/config changes) |
+| `cache.search.ttl-seconds` | `CACHE_SEARCH_TTL_SECONDS` | `300` | TTL for cached search results |
+| `cache.rag.ttl-seconds` | `CACHE_RAG_TTL_SECONDS` | `600` | TTL for cached RAG responses |
+| `spring.data.redis.host` | `REDIS_HOST` | `localhost` | Redis server hostname |
+| `spring.data.redis.port` | `REDIS_PORT` | `6379` | Redis server port |
+
+### 5. Cache Invalidation Strategy
+
+| Trigger | Invalidation Action |
+|---|---|
+| **Document Deleted** (`DocumentService.deleteDocument`) | Evict all search + RAG entries for the document owner + all ADMIN entries |
+| **Document Reprocessed** (`DocumentProcessingConsumer`) | Evict all search + RAG entries for the document owner + all ADMIN entries |
+| **TTL Expiration** | Automatic Redis expiration (search: 5min, RAG: 10min) |
+| **Model/Config Change** | Increment `cache.key-version` (e.g., `v1` → `v2`) — old keys naturally expire |
+
+> [!IMPORTANT]
+> The application **never** calls `FLUSHALL` or `FLUSHDB`. Invalidation is targeted per-owner using Redis key pattern matching.
+
+### 6. Redis Failure Behavior
+
+Redis is an optimization, not the source of truth:
+
+| Failure Type | Behavior |
+|---|---|
+| Redis read failure | Log WARN, return cache miss, execute full pipeline |
+| Redis write failure | Log WARN, return result normally, skip cache write |
+| Redis eviction failure | Log WARN, continue (TTL protects against indefinite staleness) |
+| Redis completely down | Application operates at full functionality without caching |
+
+### 7. Consistency Model
+
+- **Eventual Consistency:** Cached entries may be stale for up to the configured TTL.
+- **Active Invalidation:** Document changes trigger targeted eviction of the owner’s and ADMIN’s cached entries.
+- **Version Protection:** Model or configuration changes can be handled by incrementing `cache.key-version`, making old keys unreachable without scanning.
+- **Not Strongly Consistent:** Concurrent queries during document processing may see pre-update results until TTL expiration or invalidation completes.
+
+### 8. Local Development Setup
+
+```powershell
+# Start all infrastructure (PostgreSQL, Kafka, Qdrant, Redis)
+docker-compose -f infrastructure/docker-compose.yml up -d
+
+# Verify Redis is running
+docker exec -it ai-knowledge-redis redis-cli ping
+# Expected: PONG
+
+# Check Redis keys (after making some searches)
+docker exec -it ai-knowledge-redis redis-cli keys '*'
+
+# Monitor cache operations in real-time
+docker exec -it ai-knowledge-redis redis-cli monitor
+```
+
+### 9. How to Run Caching Tests
+
+```powershell
+# Run cache key factory tests (27 tests)
+.\mvnw.cmd test -Dtest="CacheKeyFactoryTest"
+
+# Run Redis cache service tests (12 tests)
+.\mvnw.cmd test -Dtest="RedisCacheServiceTest"
+
+# Run cache security and multi-tenant isolation tests (13 tests)
+.\mvnw.cmd test -Dtest="CacheSecurityTest"
+
+# Run NoOp cache service tests (5 tests)
+.\mvnw.cmd test -Dtest="NoOpCacheServiceTest"
+
+# Run full project regression suite (all 265 tests)
+.\mvnw.cmd test
+```

@@ -6,6 +6,7 @@ import com.enterprise.aiknowledge.repository.DocumentChunkRepository;
 import com.enterprise.aiknowledge.repository.DocumentRepository;
 import com.enterprise.aiknowledge.repository.DocumentTextRepository;
 import com.enterprise.aiknowledge.service.ChunkVectorDto;
+import com.enterprise.aiknowledge.service.CacheService;
 import com.enterprise.aiknowledge.service.ChunkingService;
 import com.enterprise.aiknowledge.service.EmbeddingService;
 import com.enterprise.aiknowledge.service.FileStorageService;
@@ -58,6 +59,7 @@ public class DocumentProcessingConsumer {
     private final ChunkingService chunkingService;
     private final EmbeddingService embeddingService;
     private final VectorStoreService vectorStoreService;
+    private final CacheService cacheService;
 
     public DocumentProcessingConsumer(
             DocumentRepository documentRepository,
@@ -68,7 +70,8 @@ public class DocumentProcessingConsumer {
             PdfTextExtractionService pdfTextExtractionService,
             ChunkingService chunkingService,
             EmbeddingService embeddingService,
-            VectorStoreService vectorStoreService) {
+            VectorStoreService vectorStoreService,
+            CacheService cacheService) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -78,6 +81,7 @@ public class DocumentProcessingConsumer {
         this.chunkingService = chunkingService;
         this.embeddingService = embeddingService;
         this.vectorStoreService = vectorStoreService;
+        this.cacheService = cacheService;
     }
 
     @KafkaListener(
@@ -207,6 +211,12 @@ public class DocumentProcessingConsumer {
                     document.getId(), extractionResult.pageCount(), chunks.size());
             document.setStatus(DocumentStatus.COMPLETED);
             documentRepository.save(document);
+
+            // Step 11: Invalidate cached search/RAG results for the document owner
+            Long ownerId = document.getOwner() != null ? document.getOwner().getId() : null;
+            if (ownerId != null) {
+                cacheService.evictByDocumentOwner(ownerId);
+            }
 
         } catch (Exception ex) {
             log.error("Failed to process document text extraction, chunking, embedding, or Qdrant indexing for document ID: {}",
