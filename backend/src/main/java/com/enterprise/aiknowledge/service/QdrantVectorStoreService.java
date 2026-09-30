@@ -54,6 +54,7 @@ public class QdrantVectorStoreService implements VectorStoreService {
     private final String apiKey;
 
     private final QdrantClientAdapter clientAdapter;
+    private com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     /**
      * Interface isolating low-level Qdrant gRPC calls for seamless offline unit testing.
@@ -127,7 +128,7 @@ public class QdrantVectorStoreService implements VectorStoreService {
             @Value("${qdrant.vector-dimensions:768}") int vectorDimensions,
             @Value("${qdrant.use-tls:false}") boolean useTls,
             @Value("${qdrant.api-key:}") String apiKey) {
-        this(host, port, grpcPort, collectionName, vectorDimensions, useTls, apiKey, null);
+        this(host, port, grpcPort, collectionName, vectorDimensions, useTls, apiKey, null, null);
     }
 
     public QdrantVectorStoreService(
@@ -139,6 +140,19 @@ public class QdrantVectorStoreService implements VectorStoreService {
             boolean useTls,
             String apiKey,
             QdrantClientAdapter customAdapter) {
+        this(host, port, grpcPort, collectionName, vectorDimensions, useTls, apiKey, customAdapter, null);
+    }
+
+    public QdrantVectorStoreService(
+            String host,
+            int port,
+            int grpcPort,
+            String collectionName,
+            int vectorDimensions,
+            boolean useTls,
+            String apiKey,
+            QdrantClientAdapter customAdapter,
+            com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         if (vectorDimensions <= 0) {
             throw new IllegalArgumentException("vectorDimensions must be greater than 0, but was: " + vectorDimensions);
         }
@@ -153,12 +167,18 @@ public class QdrantVectorStoreService implements VectorStoreService {
         this.vectorDimensions = vectorDimensions;
         this.useTls = useTls;
         this.apiKey = apiKey;
+        this.platformMetrics = platformMetrics;
 
         if (customAdapter != null) {
             this.clientAdapter = customAdapter;
         } else {
             this.clientAdapter = new DefaultQdrantClientAdapter(buildDefaultClient());
         }
+    }
+
+    @Autowired(required = false)
+    public void setPlatformMetrics(com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
+        this.platformMetrics = platformMetrics;
     }
 
     private QdrantClient buildDefaultClient() {
@@ -257,13 +277,25 @@ public class QdrantVectorStoreService implements VectorStoreService {
             points.add(point);
         }
 
+        long startTime = System.currentTimeMillis();
         try {
             clientAdapter.upsert(collectionName, points);
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantUpsert(true, System.currentTimeMillis() - startTime);
+            }
             log.info("Successfully upserted {} points into Qdrant collection '{}'", points.size(), collectionName);
         } catch (InterruptedException ie) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantUpsert(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("upsert");
+            }
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted during Qdrant upsert for collection: " + collectionName, ie);
         } catch (Exception ex) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantUpsert(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("upsert");
+            }
             Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
             throw new RuntimeException("Qdrant upsert failed for collection '" + collectionName + "': " + cause.getMessage(), cause);
         }
@@ -276,17 +308,29 @@ public class QdrantVectorStoreService implements VectorStoreService {
         }
 
         log.info("Deleting Qdrant points in collection '{}' for documentId: {}...", collectionName, documentId);
+        long startTime = System.currentTimeMillis();
         try {
             Filter filter = Filter.newBuilder()
                     .addMust(ConditionFactory.match("documentId", documentId))
                     .build();
 
             clientAdapter.delete(collectionName, filter);
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantDelete(true, System.currentTimeMillis() - startTime);
+            }
             log.info("Successfully deleted Qdrant points for documentId: {}", documentId);
         } catch (InterruptedException ie) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantDelete(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("delete");
+            }
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted during Qdrant delete for documentId: " + documentId, ie);
         } catch (Exception ex) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantDelete(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("delete");
+            }
             Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
             throw new RuntimeException("Qdrant delete failed for documentId " + documentId + ": " + cause.getMessage(), cause);
         }
@@ -320,8 +364,12 @@ public class QdrantVectorStoreService implements VectorStoreService {
             searchBuilder.setFilter(filter);
         }
 
+        long startTime = System.currentTimeMillis();
         try {
             List<ScoredPoint> scoredPoints = clientAdapter.search(searchBuilder.build());
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantSearch(true, System.currentTimeMillis() - startTime);
+            }
             log.info("Qdrant returned {} matching points", scoredPoints.size());
 
             List<ScoredChunkDto> results = new ArrayList<>(scoredPoints.size());
@@ -339,9 +387,17 @@ public class QdrantVectorStoreService implements VectorStoreService {
             }
             return results;
         } catch (InterruptedException ie) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantSearch(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("search");
+            }
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted during Qdrant vector search in collection: " + collectionName, ie);
         } catch (Exception ex) {
+            if (platformMetrics != null) {
+                platformMetrics.recordQdrantSearch(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordQdrantError("search");
+            }
             Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
             throw new RuntimeException("Qdrant vector search failed for collection '" + collectionName + "': " + cause.getMessage(), cause);
         }
@@ -352,6 +408,14 @@ public class QdrantVectorStoreService implements VectorStoreService {
             throw new IllegalStateException(String.format(
                     "Vector dimension mismatch for chunkId %d: expected %d, but was %d",
                     chunkId, vectorDimensions, vector.size()));
+        }
+    }
+
+    public boolean isHealthy() {
+        try {
+            return clientAdapter != null && clientAdapter.collectionExists(collectionName);
+        } catch (Exception e) {
+            return false;
         }
     }
 

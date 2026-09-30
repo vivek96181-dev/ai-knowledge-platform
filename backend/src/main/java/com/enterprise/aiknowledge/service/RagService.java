@@ -45,15 +45,25 @@ public class RagService {
     private final SearchService searchService;
     private final ContextBuilder contextBuilder;
     private final GenerationService generationService;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
+
+    public RagService(
+            SearchService searchService,
+            ContextBuilder contextBuilder,
+            GenerationService generationService) {
+        this(searchService, contextBuilder, generationService, null);
+    }
 
     @Autowired
     public RagService(
             SearchService searchService,
             ContextBuilder contextBuilder,
-            GenerationService generationService) {
+            GenerationService generationService,
+            @Autowired(required = false) com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.searchService = searchService;
         this.contextBuilder = contextBuilder;
         this.generationService = generationService;
+        this.platformMetrics = platformMetrics;
     }
 
     /**
@@ -85,9 +95,30 @@ public class RagService {
         log.info("Starting RAG request (user: {}, role: {}, topK: {})",
                 currentUserEmail, isAdmin ? "ADMIN" : "USER", resolvedTopK);
 
+        long totalStartTime = System.currentTimeMillis();
+
         // Step 2: Retrieve authorized chunks using existing SemanticSearchService
         SearchRequest searchRequest = new SearchRequest(trimmedQuery, resolvedTopK);
-        SearchResponse searchResponse = searchService.search(searchRequest, currentUserEmail, isAdmin);
+        long retStartTime = System.currentTimeMillis();
+        SearchResponse searchResponse;
+        try {
+            searchResponse = searchService.search(searchRequest, currentUserEmail, isAdmin);
+            long retDuration = System.currentTimeMillis() - retStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagRetrievalLatency("success", retDuration);
+            }
+        } catch (Exception e) {
+            long retDuration = System.currentTimeMillis() - retStartTime;
+            long totalDuration = System.currentTimeMillis() - totalStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagRetrievalLatency("failure", retDuration);
+                platformMetrics.recordRagTotalLatency("failure", totalDuration);
+                platformMetrics.recordRagRequest("failure");
+                platformMetrics.recordRagFailure("retrieval", e.getClass().getSimpleName());
+            }
+            throw e;
+        }
+
         List<SearchResult> searchResults = searchResponse.results();
 
         log.info("RAG retrieval finished: {} relevant chunks retrieved",
@@ -96,6 +127,11 @@ public class RagService {
         // Step 3: Conservative check for insufficient context
         if (searchResults == null || searchResults.isEmpty()) {
             log.info("No relevant chunks found. Returning conservative response without calling LLM.");
+            long totalDuration = System.currentTimeMillis() - totalStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagRequest("success");
+                platformMetrics.recordRagTotalLatency("success", totalDuration);
+            }
             return new RagResponse(trimmedQuery, DEFAULT_INSUFFICIENT_CONTEXT_MESSAGE, Collections.emptyList());
         }
 
@@ -103,6 +139,11 @@ public class RagService {
         ContextBuilder.BuiltContext builtContext = contextBuilder.buildContext(searchResults);
         if (builtContext.includedResults().isEmpty() || builtContext.contextText().isBlank()) {
             log.info("Context builder produced empty context. Returning conservative response without calling LLM.");
+            long totalDuration = System.currentTimeMillis() - totalStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagRequest("success");
+                platformMetrics.recordRagTotalLatency("success", totalDuration);
+            }
             return new RagResponse(trimmedQuery, DEFAULT_INSUFFICIENT_CONTEXT_MESSAGE, Collections.emptyList());
         }
 
@@ -110,11 +151,29 @@ public class RagService {
                 builtContext.contextText().length(), builtContext.includedResults().size());
 
         // Step 5: Generate grounded answer via Gemini
-        String answer = generationService.generateAnswer(
-                SYSTEM_INSTRUCTION,
-                builtContext.contextText(),
-                trimmedQuery
-        );
+        long genStartTime = System.currentTimeMillis();
+        String answer;
+        try {
+            answer = generationService.generateAnswer(
+                    SYSTEM_INSTRUCTION,
+                    builtContext.contextText(),
+                    trimmedQuery
+            );
+            long genDuration = System.currentTimeMillis() - genStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagGenerationLatency("success", genDuration);
+            }
+        } catch (Exception e) {
+            long genDuration = System.currentTimeMillis() - genStartTime;
+            long totalDuration = System.currentTimeMillis() - totalStartTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordRagGenerationLatency("failure", genDuration);
+                platformMetrics.recordRagTotalLatency("failure", totalDuration);
+                platformMetrics.recordRagRequest("failure");
+                platformMetrics.recordRagFailure("generation", e.getClass().getSimpleName());
+            }
+            throw e;
+        }
 
         // Step 6: Map only the included search results to source references
         List<RagSource> sources = builtContext.includedResults().stream()
@@ -127,7 +186,14 @@ public class RagService {
                 ))
                 .toList();
 
-        log.info("RAG generation completed successfully with {} sources", sources.size());
+        long totalDuration = System.currentTimeMillis() - totalStartTime;
+        if (platformMetrics != null) {
+            platformMetrics.recordRagRequest("success");
+            platformMetrics.recordRagTotalLatency("success", totalDuration);
+        }
+
+        log.info("RAG generation completed successfully with {} sources in {} ms",
+                sources.size(), totalDuration);
 
         return new RagResponse(trimmedQuery, answer, sources);
     }

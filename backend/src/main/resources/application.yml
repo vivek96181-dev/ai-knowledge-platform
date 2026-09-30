@@ -132,5 +132,39 @@ cache:
   rag:
     ttl-seconds: ${CACHE_RAG_TTL_SECONDS:600}
 
+# Spring Boot Actuator & Observability configuration
+management:
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+      roles: ROLE_ADMIN
+      probes:
+        enabled: true
+    prometheus:
+      enabled: true
+    metrics:
+      enabled: true
+    info:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name:ai-knowledge-platform}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        aikp.search.latency: true
+        aikp.rerank.latency: true
+        aikp.rag.total.latency: true
+
+
 
 

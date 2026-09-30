@@ -54,6 +54,7 @@ public class SearchController {
     private final UserRepository userRepository;
     private final long searchTtlSeconds;
     private final int defaultTopK;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     public SearchController(
             SemanticSearchService semanticSearchService,
@@ -64,6 +65,22 @@ public class SearchController {
             UserRepository userRepository,
             @Value("${cache.search.ttl-seconds:300}") long searchTtlSeconds,
             @Value("${search.default-top-k:5}") int defaultTopK) {
+        this(semanticSearchService, keywordSearchService, hybridSearchService, cacheService,
+                cacheKeyFactory, userRepository, searchTtlSeconds, defaultTopK, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public SearchController(
+            SemanticSearchService semanticSearchService,
+            KeywordSearchService keywordSearchService,
+            HybridSearchService hybridSearchService,
+            CacheService cacheService,
+            CacheKeyFactory cacheKeyFactory,
+            UserRepository userRepository,
+            @Value("${cache.search.ttl-seconds:300}") long searchTtlSeconds,
+            @Value("${search.default-top-k:5}") int defaultTopK,
+            @org.springframework.beans.factory.annotation.Autowired(required = false)
+            com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.semanticSearchService = semanticSearchService;
         this.keywordSearchService = keywordSearchService;
         this.hybridSearchService = hybridSearchService;
@@ -72,6 +89,7 @@ public class SearchController {
         this.userRepository = userRepository;
         this.searchTtlSeconds = searchTtlSeconds;
         this.defaultTopK = defaultTopK;
+        this.platformMetrics = platformMetrics;
     }
 
     /**
@@ -107,11 +125,29 @@ public class SearchController {
         }
 
         // Cache miss: execute search pipeline
-        SearchResponse response = switch (mode) {
-            case SEMANTIC -> semanticSearchService.search(request, currentUserEmail, isAdmin);
-            case KEYWORD -> keywordSearchService.search(request, currentUserEmail, isAdmin);
-            case HYBRID -> hybridSearchService.search(request, currentUserEmail, isAdmin);
-        };
+        long startTime = System.currentTimeMillis();
+        SearchResponse response;
+        try {
+            response = switch (mode) {
+                case SEMANTIC -> semanticSearchService.search(request, currentUserEmail, isAdmin);
+                case KEYWORD -> keywordSearchService.search(request, currentUserEmail, isAdmin);
+                case HYBRID -> hybridSearchService.search(request, currentUserEmail, isAdmin);
+            };
+            long duration = System.currentTimeMillis() - startTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordSearchRequest(mode.name(), "success");
+                platformMetrics.recordSearchLatency(mode.name(), "success", duration);
+                platformMetrics.recordSearchResults(mode.name(), response.results() != null ? response.results().size() : 0);
+            }
+        } catch (Exception e) {
+            long duration = System.currentTimeMillis() - startTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordSearchRequest(mode.name(), "failure");
+                platformMetrics.recordSearchLatency(mode.name(), "failure", duration);
+                platformMetrics.recordSearchFailure(mode.name(), e.getClass().getSimpleName());
+            }
+            throw e;
+        }
 
         // Cache the authorized result
         if (cacheService.isEnabled()) {
@@ -157,7 +193,25 @@ public class SearchController {
         }
 
         // Cache miss: execute hybrid search pipeline
-        SearchResponse response = hybridSearchService.search(request, currentUserEmail, isAdmin);
+        long startTime = System.currentTimeMillis();
+        SearchResponse response;
+        try {
+            response = hybridSearchService.search(request, currentUserEmail, isAdmin);
+            long duration = System.currentTimeMillis() - startTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordSearchRequest("HYBRID", "success");
+                platformMetrics.recordSearchLatency("HYBRID", "success", duration);
+                platformMetrics.recordSearchResults("HYBRID", response.results() != null ? response.results().size() : 0);
+            }
+        } catch (Exception e) {
+            long duration = System.currentTimeMillis() - startTime;
+            if (platformMetrics != null) {
+                platformMetrics.recordSearchRequest("HYBRID", "failure");
+                platformMetrics.recordSearchLatency("HYBRID", "failure", duration);
+                platformMetrics.recordSearchFailure("HYBRID", e.getClass().getSimpleName());
+            }
+            throw e;
+        }
 
         // Cache the authorized result
         if (cacheService.isEnabled()) {

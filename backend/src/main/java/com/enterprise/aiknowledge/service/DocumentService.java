@@ -39,6 +39,7 @@ public class DocumentService {
     private final DocumentEventProducer documentEventProducer;
     private final VectorStoreService vectorStoreService;
     private final CacheService cacheService;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     public DocumentService(
             DocumentRepository documentRepository,
@@ -50,6 +51,24 @@ public class DocumentService {
             DocumentEventProducer documentEventProducer,
             VectorStoreService vectorStoreService,
             CacheService cacheService) {
+        this(documentRepository, documentTextRepository, documentChunkRepository,
+                documentChunkEmbeddingRepository, userRepository, fileStorageService,
+                documentEventProducer, vectorStoreService, cacheService, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public DocumentService(
+            DocumentRepository documentRepository,
+            DocumentTextRepository documentTextRepository,
+            com.enterprise.aiknowledge.repository.DocumentChunkRepository documentChunkRepository,
+            com.enterprise.aiknowledge.repository.DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository,
+            UserRepository userRepository,
+            FileStorageService fileStorageService,
+            DocumentEventProducer documentEventProducer,
+            VectorStoreService vectorStoreService,
+            CacheService cacheService,
+            @org.springframework.beans.factory.annotation.Autowired(required = false)
+            com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -59,6 +78,7 @@ public class DocumentService {
         this.documentEventProducer = documentEventProducer;
         this.vectorStoreService = vectorStoreService;
         this.cacheService = cacheService;
+        this.platformMetrics = platformMetrics;
     }
 
     /**
@@ -69,63 +89,74 @@ public class DocumentService {
      * @return response DTO containing document metadata with status UPLOADED
      */
     public DocumentResponse uploadDocument(MultipartFile file, String currentUserEmail) {
-        // Validate file presence
-        if (file == null || file.isEmpty()) {
-            throw new InvalidFileException("File is required and must not be empty");
+        try {
+            // Validate file presence
+            if (file == null || file.isEmpty()) {
+                throw new InvalidFileException("File is required and must not be empty");
+            }
+
+            // Validate original filename
+            String originalFilename = file.getOriginalFilename();
+            if (originalFilename == null || originalFilename.isBlank()) {
+                throw new InvalidFileException("Filename must not be empty");
+            }
+
+            String cleanFilename = StringUtils.cleanPath(originalFilename);
+
+            // Validate PDF type (MIME type and file extension)
+            String contentType = file.getContentType();
+            boolean isValidMime = contentType != null && (
+                    contentType.equalsIgnoreCase("application/pdf") ||
+                    contentType.equalsIgnoreCase("application/x-pdf")
+            );
+            boolean hasPdfExtension = cleanFilename.toLowerCase().endsWith(".pdf");
+
+            if (!isValidMime || !hasPdfExtension) {
+                throw new InvalidFileException("Invalid file type. Only PDF documents are allowed");
+            }
+
+            // Resolve authenticated user owner
+            User owner = userRepository.findByEmail(currentUserEmail)
+                    .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + currentUserEmail));
+
+            // Generate safe unique stored filename
+            String storedFilename = UUID.randomUUID().toString() + "_" + cleanFilename;
+
+            // Store file physically
+            String storagePath = fileStorageService.storeFile(file, storedFilename);
+
+            // Build entity with initial status UPLOADED
+            Document document = new Document();
+            document.setOwner(owner);
+            document.setOriginalFilename(cleanFilename);
+            document.setStoredFilename(storedFilename);
+            document.setContentType(contentType);
+            document.setFileSize(file.getSize());
+            document.setStoragePath(storagePath);
+            document.setStatus(DocumentStatus.UPLOADED);
+
+            Document savedDocument = documentRepository.save(document);
+
+            // Publish asynchronous Kafka event for background processing
+            DocumentUploadedEvent event = new DocumentUploadedEvent(
+                    savedDocument.getId(),
+                    owner.getId(),
+                    storagePath,
+                    cleanFilename
+            );
+            documentEventProducer.sendDocumentUploadedEvent(event);
+
+            if (platformMetrics != null) {
+                platformMetrics.recordDocumentUploaded(true);
+            }
+
+            return mapToResponse(savedDocument);
+        } catch (Exception ex) {
+            if (platformMetrics != null) {
+                platformMetrics.recordDocumentUploaded(false);
+            }
+            throw ex;
         }
-
-        // Validate original filename
-        String originalFilename = file.getOriginalFilename();
-        if (originalFilename == null || originalFilename.isBlank()) {
-            throw new InvalidFileException("Filename must not be empty");
-        }
-
-        String cleanFilename = StringUtils.cleanPath(originalFilename);
-
-        // Validate PDF type (MIME type and file extension)
-        String contentType = file.getContentType();
-        boolean isValidMime = contentType != null && (
-                contentType.equalsIgnoreCase("application/pdf") ||
-                contentType.equalsIgnoreCase("application/x-pdf")
-        );
-        boolean hasPdfExtension = cleanFilename.toLowerCase().endsWith(".pdf");
-
-        if (!isValidMime || !hasPdfExtension) {
-            throw new InvalidFileException("Invalid file type. Only PDF documents are allowed");
-        }
-
-        // Resolve authenticated user owner
-        User owner = userRepository.findByEmail(currentUserEmail)
-                .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + currentUserEmail));
-
-        // Generate safe unique stored filename
-        String storedFilename = UUID.randomUUID().toString() + "_" + cleanFilename;
-
-        // Store file physically
-        String storagePath = fileStorageService.storeFile(file, storedFilename);
-
-        // Build entity with initial status UPLOADED
-        Document document = new Document();
-        document.setOwner(owner);
-        document.setOriginalFilename(cleanFilename);
-        document.setStoredFilename(storedFilename);
-        document.setContentType(contentType);
-        document.setFileSize(file.getSize());
-        document.setStoragePath(storagePath);
-        document.setStatus(DocumentStatus.UPLOADED);
-
-        Document savedDocument = documentRepository.save(document);
-
-        // Publish asynchronous Kafka event for background processing
-        DocumentUploadedEvent event = new DocumentUploadedEvent(
-                savedDocument.getId(),
-                owner.getId(),
-                storagePath,
-                cleanFilename
-        );
-        documentEventProducer.sendDocumentUploadedEvent(event);
-
-        return mapToResponse(savedDocument);
     }
 
     /**

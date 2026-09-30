@@ -38,42 +38,68 @@ public class RedisCacheService implements CacheService {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper cacheObjectMapper;
     private final CacheKeyFactory cacheKeyFactory;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     public RedisCacheService(
             StringRedisTemplate redisTemplate,
             @Qualifier("cacheObjectMapper") ObjectMapper cacheObjectMapper,
             CacheKeyFactory cacheKeyFactory) {
+        this(redisTemplate, cacheObjectMapper, cacheKeyFactory, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RedisCacheService(
+            StringRedisTemplate redisTemplate,
+            @Qualifier("cacheObjectMapper") ObjectMapper cacheObjectMapper,
+            CacheKeyFactory cacheKeyFactory,
+            @org.springframework.beans.factory.annotation.Autowired(required = false)
+            com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.redisTemplate = redisTemplate;
         this.cacheObjectMapper = cacheObjectMapper;
         this.cacheKeyFactory = cacheKeyFactory;
+        this.platformMetrics = platformMetrics;
         log.info("RedisCacheService initialized (cache enabled)");
     }
 
     @Override
     public <T> Optional<T> get(String key, Class<T> type) {
+        String cacheName = resolveCacheName(key);
         try {
             String json = redisTemplate.opsForValue().get(key);
             if (json == null) {
                 log.debug("Cache MISS: {}", key);
+                if (platformMetrics != null) {
+                    platformMetrics.recordCacheMiss(cacheName);
+                }
                 return Optional.empty();
             }
             T value = cacheObjectMapper.readValue(json, type);
             log.info("Cache HIT: {}", key);
+            if (platformMetrics != null) {
+                platformMetrics.recordCacheHit(cacheName);
+            }
             return Optional.of(value);
         } catch (Exception e) {
             log.warn("Cache read failure for key [{}]: {}", key, e.getMessage());
+            if (platformMetrics != null) {
+                platformMetrics.recordCacheReadFailure(cacheName);
+            }
             return Optional.empty();
         }
     }
 
     @Override
     public void put(String key, Object value, long ttlSeconds) {
+        String cacheName = resolveCacheName(key);
         try {
             String json = cacheObjectMapper.writeValueAsString(value);
             redisTemplate.opsForValue().set(key, json, Duration.ofSeconds(ttlSeconds));
             log.debug("Cache PUT: {} (TTL: {}s)", key, ttlSeconds);
         } catch (Exception e) {
             log.warn("Cache write failure for key [{}]: {}", key, e.getMessage());
+            if (platformMetrics != null) {
+                platformMetrics.recordCacheWriteFailure(cacheName);
+            }
         }
     }
 
@@ -83,6 +109,9 @@ public class RedisCacheService implements CacheService {
             Boolean deleted = redisTemplate.delete(key);
             if (Boolean.TRUE.equals(deleted)) {
                 log.debug("Cache EVICT: {}", key);
+                if (platformMetrics != null) {
+                    platformMetrics.recordCacheInvalidation("key");
+                }
             }
         } catch (Exception e) {
             log.warn("Cache evict failure for key [{}]: {}", key, e.getMessage());
@@ -102,12 +131,23 @@ public class RedisCacheService implements CacheService {
             totalEvicted += evictByPattern(cacheKeyFactory.buildAdminSearchPattern());
             totalEvicted += evictByPattern(cacheKeyFactory.buildAdminRagPattern());
 
+            if (platformMetrics != null) {
+                platformMetrics.recordCacheInvalidation("owner");
+            }
+
             log.info("Cache invalidation for document owner [userId={}]: {} entries evicted",
                     ownerUserId, totalEvicted);
         } catch (Exception e) {
             log.warn("Cache invalidation failure for owner [userId={}]: {}",
                     ownerUserId, e.getMessage());
         }
+    }
+
+    private String resolveCacheName(String key) {
+        if (key == null) return "general";
+        if (key.startsWith("search")) return "search";
+        if (key.startsWith("rag")) return "rag";
+        return "general";
     }
 
     @Override

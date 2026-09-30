@@ -60,6 +60,7 @@ public class DocumentProcessingConsumer {
     private final EmbeddingService embeddingService;
     private final VectorStoreService vectorStoreService;
     private final CacheService cacheService;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     public DocumentProcessingConsumer(
             DocumentRepository documentRepository,
@@ -72,6 +73,25 @@ public class DocumentProcessingConsumer {
             EmbeddingService embeddingService,
             VectorStoreService vectorStoreService,
             CacheService cacheService) {
+        this(documentRepository, documentTextRepository, documentChunkRepository,
+                documentChunkEmbeddingRepository, fileStorageService, pdfTextExtractionService,
+                chunkingService, embeddingService, vectorStoreService, cacheService, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public DocumentProcessingConsumer(
+            DocumentRepository documentRepository,
+            DocumentTextRepository documentTextRepository,
+            DocumentChunkRepository documentChunkRepository,
+            DocumentChunkEmbeddingRepository documentChunkEmbeddingRepository,
+            FileStorageService fileStorageService,
+            PdfTextExtractionService pdfTextExtractionService,
+            ChunkingService chunkingService,
+            EmbeddingService embeddingService,
+            VectorStoreService vectorStoreService,
+            CacheService cacheService,
+            @org.springframework.beans.factory.annotation.Autowired(required = false)
+            com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.documentRepository = documentRepository;
         this.documentTextRepository = documentTextRepository;
         this.documentChunkRepository = documentChunkRepository;
@@ -82,6 +102,7 @@ public class DocumentProcessingConsumer {
         this.embeddingService = embeddingService;
         this.vectorStoreService = vectorStoreService;
         this.cacheService = cacheService;
+        this.platformMetrics = platformMetrics;
     }
 
     @KafkaListener(
@@ -90,6 +111,12 @@ public class DocumentProcessingConsumer {
     )
     @Transactional
     public void consume(DocumentUploadedEvent event) {
+        if (platformMetrics != null) {
+            platformMetrics.recordKafkaEventConsumed("document-uploaded", true);
+        }
+        long startTime = System.currentTimeMillis();
+        String currentPhase = "storage";
+
         log.info("Received DocumentUploadedEvent for document ID: {}, storagePath: {}",
                 event.documentId(), event.storagePath());
 
@@ -136,12 +163,18 @@ public class DocumentProcessingConsumer {
                         document.getStoragePath(), document.getId());
                 document.setStatus(DocumentStatus.FAILED);
                 documentRepository.save(document);
+                if (platformMetrics != null) {
+                    platformMetrics.recordDocumentFailure("storage");
+                    platformMetrics.recordDocumentProcessed(false);
+                    platformMetrics.recordDocumentProcessingLatency(false, System.currentTimeMillis() - startTime);
+                }
                 return;
             }
 
             Path path = Paths.get(document.getStoragePath()).toAbsolutePath().normalize();
 
             // Step 5: Extract text per page using PDFBox
+            currentPhase = "extraction";
             log.info("Extracting PDF text for document ID: {} from path: {}", document.getId(), path);
             PdfExtractionResult extractionResult = pdfTextExtractionService.extractText(path);
 
@@ -158,12 +191,14 @@ public class DocumentProcessingConsumer {
             documentChunkEmbeddingRepository.deleteByDocumentChunkDocumentId(document.getId());
             documentChunkRepository.deleteByDocumentId(document.getId());
 
+            currentPhase = "chunking";
             List<DocumentChunk> chunks = chunkingService.chunkDocument(document, extractionResult.pages());
             if (!chunks.isEmpty()) {
                 chunks = documentChunkRepository.saveAll(chunks);
                 log.info("Saved {} chunks for document ID: {}", chunks.size(), document.getId());
 
                 // Step 8: Generate vector embeddings for all chunks via EmbeddingService
+                currentPhase = "embedding";
                 log.info("Generating embeddings for {} chunks of document ID: {} using model: {}",
                         chunks.size(), document.getId(), embeddingService.getModel());
                 Map<Long, List<Float>> vectorMap = embeddingService.generateBatchEmbeddings(chunks);
@@ -198,6 +233,7 @@ public class DocumentProcessingConsumer {
                         embeddingsToSave.size(), document.getId());
 
                 // Step 9: Upsert vector points with payload into Qdrant
+                currentPhase = "indexing";
                 log.info("Upserting {} vector points into Qdrant collection '{}' for document ID: {}",
                         chunkVectorsToIndex.size(), vectorStoreService.getCollectionName(), document.getId());
                 vectorStoreService.upsertChunkVectors(chunkVectorsToIndex);
@@ -212,6 +248,11 @@ public class DocumentProcessingConsumer {
             document.setStatus(DocumentStatus.COMPLETED);
             documentRepository.save(document);
 
+            if (platformMetrics != null) {
+                platformMetrics.recordDocumentProcessed(true);
+                platformMetrics.recordDocumentProcessingLatency(true, System.currentTimeMillis() - startTime);
+            }
+
             // Step 11: Invalidate cached search/RAG results for the document owner
             Long ownerId = document.getOwner() != null ? document.getOwner().getId() : null;
             if (ownerId != null) {
@@ -219,6 +260,12 @@ public class DocumentProcessingConsumer {
             }
 
         } catch (Exception ex) {
+            if (platformMetrics != null) {
+                platformMetrics.recordDocumentFailure(currentPhase);
+                platformMetrics.recordDocumentProcessed(false);
+                platformMetrics.recordDocumentProcessingLatency(false, System.currentTimeMillis() - startTime);
+                platformMetrics.recordKafkaProcessingFailure(ex.getClass().getSimpleName());
+            }
             log.error("Failed to process document text extraction, chunking, embedding, or Qdrant indexing for document ID: {}",
                     document.getId(), ex);
             document.setStatus(DocumentStatus.FAILED);
