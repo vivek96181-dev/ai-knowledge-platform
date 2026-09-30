@@ -75,12 +75,17 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 // Public endpoints — no token required
                 .requestMatchers("/api/health").permitAll()
+                .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                .requestMatchers("/actuator/info").permitAll()
+                .requestMatchers("/actuator/prometheus").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/users").permitAll()  // Registration is open
 
                 // ADMIN-only endpoints
                 .requestMatchers(HttpMethod.GET, "/api/users").hasRole("ADMIN")       // List all users
                 .requestMatchers(HttpMethod.DELETE, "/api/users/**").hasRole("ADMIN") // Delete any user
+                .requestMatchers("/actuator/metrics", "/actuator/metrics/**").hasRole("ADMIN") // Actuator metrics inspection
+                .requestMatchers("/actuator/**").hasRole("ADMIN")                     // Other management endpoints
 
                 // Any authenticated user (USER or ADMIN)
                 .requestMatchers(HttpMethod.GET, "/api/users/**").authenticated()     // Get user by ID

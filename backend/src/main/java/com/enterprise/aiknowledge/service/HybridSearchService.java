@@ -44,6 +44,7 @@ public class HybridSearchService {
     private final DocumentChunkRepository documentChunkRepository;
     private final UserRepository userRepository;
     private final Reranker reranker;
+    private final com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics;
 
     private final int defaultTopK;
     private final int maxTopK;
@@ -56,6 +57,28 @@ public class HybridSearchService {
     private final boolean rerankingEnabled;
     private final int rerankCandidateCount;
     private final boolean fallbackToRrf;
+
+    public HybridSearchService(
+            SemanticSearchService semanticSearchService,
+            KeywordSearchService keywordSearchService,
+            ReciprocalRankFuser reciprocalRankFuser,
+            DocumentChunkRepository documentChunkRepository,
+            UserRepository userRepository,
+            Reranker reranker,
+            @Value("${search.default-top-k:5}") int defaultTopK,
+            @Value("${search.max-top-k:20}") int maxTopK,
+            @Value("${search.hybrid.rrf-k:60}") int rrfK,
+            @Value("${search.hybrid.semantic-weight:1.0}") double semanticWeight,
+            @Value("${search.hybrid.keyword-weight:1.0}") double keywordWeight,
+            @Value("${search.hybrid.semantic-candidates:20}") int semanticCandidatesLimit,
+            @Value("${search.hybrid.keyword-candidates:20}") int keywordCandidatesLimit,
+            @Value("${search.reranking.enabled:true}") boolean rerankingEnabled,
+            @Value("${search.reranking.candidate-count:20}") int rerankCandidateCount,
+            @Value("${search.reranking.fallback-to-rrf:true}") boolean fallbackToRrf) {
+        this(semanticSearchService, keywordSearchService, reciprocalRankFuser, documentChunkRepository,
+                userRepository, reranker, defaultTopK, maxTopK, rrfK, semanticWeight, keywordWeight,
+                semanticCandidatesLimit, keywordCandidatesLimit, rerankingEnabled, rerankCandidateCount, fallbackToRrf, null);
+    }
 
     @Autowired
     public HybridSearchService(
@@ -74,7 +97,8 @@ public class HybridSearchService {
             @Value("${search.hybrid.keyword-candidates:20}") int keywordCandidatesLimit,
             @Value("${search.reranking.enabled:true}") boolean rerankingEnabled,
             @Value("${search.reranking.candidate-count:20}") int rerankCandidateCount,
-            @Value("${search.reranking.fallback-to-rrf:true}") boolean fallbackToRrf) {
+            @Value("${search.reranking.fallback-to-rrf:true}") boolean fallbackToRrf,
+            @Autowired(required = false) com.enterprise.aiknowledge.observability.PlatformMetrics platformMetrics) {
         this.semanticSearchService = semanticSearchService;
         this.keywordSearchService = keywordSearchService;
         this.reciprocalRankFuser = reciprocalRankFuser;
@@ -91,6 +115,7 @@ public class HybridSearchService {
         this.rerankingEnabled = rerankingEnabled;
         this.rerankCandidateCount = rerankCandidateCount;
         this.fallbackToRrf = fallbackToRrf;
+        this.platformMetrics = platformMetrics;
     }
 
     /**
@@ -204,8 +229,17 @@ public class HybridSearchService {
         List<SearchResult> results = new ArrayList<>();
 
         if (shouldRerank && !authorizedCandidates.isEmpty()) {
+            if (platformMetrics != null) {
+                platformMetrics.recordRerankCandidates(authorizedCandidates.size());
+            }
+            long startTime = System.currentTimeMillis();
             try {
                 List<RerankedCandidate> reranked = reranker.rerank(trimmedQuery, authorizedCandidates, resolvedTopK);
+                long latency = System.currentTimeMillis() - startTime;
+                if (platformMetrics != null) {
+                    platformMetrics.recordRerankRequest("success");
+                    platformMetrics.recordRerankLatency("success", latency);
+                }
                 for (RerankedCandidate rc : reranked) {
                     RerankCandidate c = rc.candidate();
                     results.add(new SearchResult(
@@ -221,7 +255,16 @@ public class HybridSearchService {
                 log.info("Hybrid search with reranking completed: {} candidates -> {} final results",
                         authorizedCandidates.size(), results.size());
             } catch (Exception e) {
+                long latency = System.currentTimeMillis() - startTime;
+                if (platformMetrics != null) {
+                    platformMetrics.recordRerankRequest("failure");
+                    platformMetrics.recordRerankLatency("failure", latency);
+                    platformMetrics.recordRerankFailure(e.getClass().getSimpleName());
+                }
                 if (fallbackToRrf) {
+                    if (platformMetrics != null) {
+                        platformMetrics.recordRerankFallback();
+                    }
                     log.warn("Reranking failed for query ({}). Explicitly falling back to RRF candidate ranking without rerank scores.",
                             e.getMessage());
                     // Fall back explicitly to pre-reranked RRF order truncated to topK

@@ -27,4 +27,12 @@ public interface DocumentRepository extends JpaRepository<Document, Long> {
      * @return optional containing the document if found and owned by the user
      */
     Optional<Document> findByIdAndOwnerId(Long id, Long ownerId);
+
+    /**
+     * Counts the number of documents in a specific processing status.
+     *
+     * @param status the document status
+     * @return count of documents with the given status
+     */
+    long countByStatus(com.enterprise.aiknowledge.model.DocumentStatus status);
 }
